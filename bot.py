@@ -16,7 +16,7 @@ from discord import app_commands
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("KandaBot")
 
-# ── Cấu hình Bot (Đọc từ biến môi trường Railway / Render / .env) ──
+# ── Cấu hình Bot (Fallback Token nếu không dùng biến môi trường) ──
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 
 intents = discord.Intents.default()
@@ -208,7 +208,7 @@ jobs:
     env:
       RDP_USER: Kandagawa
       RDP_PASS: Kandagw@12345
-      STATE_DIR: C:\KandaState
+      STATE_DIR: C:\\KandaState
     steps:
       - name: Enable RDP user + Admin Rights
         run: |
@@ -492,7 +492,10 @@ async def rdp_menu(interaction: discord.Interaction):
 
     menu_content = (
         "
-```ansi\n\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n```\n"
+```ansi\n"
+        "\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n"
+        "
+```\n"
         f"👤 **Tài khoản GitHub:** `{github_username}`\n"
         f"{instances_text}"
     )
