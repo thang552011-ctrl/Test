@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("KandaBot")
 
 # ── Token Cố Định Theo Yêu Cầu ──
-TOKEN = "MTU1NzAzMjMzNDk0MTg4ODYzMw.GFxzAH.jpVUwILSnWlMBYSxv-p5neHai90GYwdcHahRvU"
+TOKEN = "MTU1NzAzMjMzNDk0MTg4ODYzMw.GgMvAZ.dju-UkEGPhMosQdsUzdqOW5472xUL4x5yvlSVw"
 
 intents = discord.Intents.default()
 intents.message_content = True
