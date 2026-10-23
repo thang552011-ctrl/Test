@@ -1,0 +1,245 @@
+name: Kanda RDP Zero-Touch 24/7 (Watchdog & Defender Bypass)
+​on:
+workflow_dispatch:
+inputs:
+quick_test:
+description: "Run 5-minute test"
+type: boolean
+default: false
+runtime_minutes:
+description: "Runtime (max 360; default 355)"
+required: false
+default: "355"
+rdp_count:
+description: "How many RDP instances (1-20)"
+required: false
+default: "1"
+user_id:
+description: "Workspace Bucket ID (UID Discord)"
+required: false
+default: "default_user"
+​permissions:
+contents: write
+actions: write
+​defaults:
+run:
+shell: pwsh
+​jobs:
+setup:
+runs-on: ubuntu-latest
+outputs:
+matrix: ${{ steps.mk.outputs.matrix }}
+steps:
+- id: mk
+run: |
+n = [int]"{{ inputs.rdp_count }}"
+if ($n -lt 1) {$n = 1 }
+if ($n -gt 20) { $n = 20 }$inc = @()
+for ($i=1; $i -le $n; $i++) { $inc += @{ id =$i } }
+$json = (@{ include =$inc } | ConvertTo-Json -Compress)
+"matrix=$json" >> $env:GITHUB_OUTPUT
+​rdp:
+needs: setup
+runs-on: windows-latest
+strategy:
+matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+max-parallel: 4
+timeout-minutes: 370
+env:
+RDP_USER: Kandagawa
+RDP_PASS: Kandagw@12345
+STATE_DIR: C:\KandaState
+​steps:
+- name: Decide hostname
+run: |
+if ([int]"${{ inputs.rdp_count }}" -gt 1) {
+hn = "kanda{{ matrix.id }}"
+} else {
+$hn = "kanda"
+}
+"RDP_HOSTNAME=$hn" >> $env:GITHUB_ENV
+Write-Host "Hostname: $hn"
+​- name: Enable RDP user + Admin Rights
+run: |
+$secFile = "$env:TEMP\secedit.cfg"
+$secNew = "$env:TEMP\secedit_new.cfg"
+secedit /export /cfg $secFile /quiet 2>$null
+if (Test-Path $secFile) {
+(Get-Content secFile) -replace 'PasswordComplexity = 1','PasswordComplexity = 0' -replace 'MinimumPasswordLength = \d+','MinimumPasswordLength = 0' \vert{} Set-ContentsecNew
+secedit /configure /db secedit.sdb /cfg $secNew /quiet 2>$null
+}
+$u =$env:RDP_USER
+$p =$env:RDP_PASS
+sec = ConvertTo-SecureStringp -AsPlainText -Force
+if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
+New-LocalUser -Name u -Passwordsec -AccountNeverExpires
+Add-LocalGroupMember -Group "Administrators" -Member $u
+Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+} else {
+Set-LocalUser -Name u -Passwordsec -AccountNeverExpires
+Enable-LocalUser -Name $u
+Add-LocalGroupMember -Group "Administrators" -Member $u -EA SilentlyContinue
+Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -EA SilentlyContinue
+}
+Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+​- name: Ultimate Performance & Total Windows Defender Bypass
+run: |
+try {
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
+reg add "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" /v Win32PrioritySeparation /t REG_DWORD /d 38 /f | Out-Null
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
+​Set-MpPreference -DisableRealtimeMonitoring $true -EA SilentlyContinue
+Set-MpPreference -DisableBehaviorMonitoring $true -EA SilentlyContinue
+Set-MpPreference -DisableScanOnRealtimeEnable $true -EA SilentlyContinue
+Set-MpPreference -DisableIOAVProtection $true -EA SilentlyContinue
+Set-MpPreference -DisableScriptScanning $true -EA SilentlyContinue
+Set-MpPreference -DisableArchiveScanning $true -EA SilentlyContinue
+Add-MpPreference -ExclusionPath "C:" -EA SilentlyContinue
+Stop-Service -Name WinDefend -Force -EA SilentlyContinue
+Stop-Service -Name WdNisSvc -Force -EA SilentlyContinue
+Set-Service -Name WinDefend -StartupType Disabled -EA SilentlyContinue
+Set-Service -Name WdNisSvc -StartupType Disabled -EA SilentlyContinue
+Write-Host "[+] Windows Defender disabled & Full C:\ exclusion applied successfully."
+} catch { Write-Host ("[!] Defender bypass notice: " + $_.Exception.Message) }
+​- name: Zero-Touch Auto Restore & Watchdog Setup
+env:
+GH_TOKEN: ${{ github.token }}
+USER_ID: ${{ inputs.user_id }}
+run: |
+$u = env:RDP_USERuserProfile = "C:\Users$u"
+$stateDir = env:STATE_DIRtagName = "kanda-state-env:USER_ID-slot{{ matrix.id }}"
+$zipFile = "$env:TEMP\kanda_state.7z"
+​New-Item -ItemType Directory -Force -Path stateDir \vert{} Out-NulltargetDirs = @("$userProfile\Desktop", "$userProfile\Downloads", "$userProfile\Documents", "$userProfile\AppData\Roaming")
+foreach ($d in targetDirs) { New-Item -ItemType Directory -Force -Pathd | Out-Null }
+​Write-Host "[+] Cài đặt Tesseract OCR..."
+try {
+winget install UB-Mannheim.TesseractOCR --accept-source-agreements --accept-package-agreements -h 2>$null
+} catch {}
+​try {
+gh release download $tagName --pattern "kanda_state.7z" --dir "$env:TEMP" --clobber 2>$null
+if (Test-Path zipFile) { 7z xzipFile -o"C:" -y | Out-Null
+Remove-Item $zipFile -Force -EA SilentlyContinue
+Write-Host "[+] Khôi phục thành công dữ liệu máy cũ!"
+}
+} catch {
+Write-Host "[i] Khởi tạo máy mới hoàn toàn."
+}
+​icacls userProfile /grant "{u}:(OI)(CI)F" /T /Q 2>$null | Out-Null
+​$watchdogScript = @"
+param([string]`$AppPath)
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
+​function Invoke-OCRClick {
+param([string]$targetWord) try { $screenshotPath = "$env:TEMP\screen_check.png" $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height $graphics = [System.Drawing.Graphics]::FromImage($bmp) $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+$bmp.Save($screenshotPath, [System.Drawing.Imaging.ImageFormat]::Png) $graphics.Dispose() $bmp.Dispose()
+​$tesseractOut = "$env:TEMP\ocr_res"
+& "C:\Program Files\Tesseract-OCR\tesseract.exe" $screenshotPath $tesseractOut -l eng 2>$null $tsvFile = "$tesseractOut.tsv" if (Test-Path $tsvFile) {
+foreach ($line in (Get-Content $tsvFile)) {
+if ($line -match $targetWord) { $cols = $line -split "t" if ($cols.Length -ge 11) {
+$x = [int]$cols[6]; $y = [int]$cols[7]; $w = [int]$cols[8]; $h = [int]$cols[9] $cx = $x + [math]::Floor($w / 2); $cy = $y + [math]::Floor($h / 2)
+[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($cx, $cy) [System.Windows.Forms.SendKeys]::SendWait("{DOWN}") Start-Sleep -Milliseconds 300 return $true } } } } } catch {} return $false
+}
+​Start-Sleep -Seconds 10
+$stateFile = "C:\KandaState\running_apps.json" while ($true) {
+if (Test-Path $stateFile) { try { $apps = Get-Content $stateFile -Raw | ConvertFrom-Json foreach ($app in $apps) { if ($app.Path -and (Test-Path $app.Path)) { $procName = [System.IO.Path]::GetFileNameWithoutExtension($app.Path) if (-not (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
+Start-Process -FilePath $app.Path -WindowStyle Hidden -ErrorAction SilentlyContinue Start-Sleep -Seconds 5 foreach ($kw in @("Login", "START")) { Invoke-OCRClick -targetWord `$kw; Start-Sleep -Seconds 2 }
+}
+}
+}
+} catch {}
+}
+Start-Sleep -Seconds 30
+}
+"@
+$watchdogPath = "$stateDir\watchdog_daemon.ps1"
+watchdogScript \vert{} Set-Content -PathwatchdogPath -Encoding UTF8
+​$startupDir = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
+"@echo offnpowershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$watchdogPath"" \vert{} Set-Content -Path "$startupDir\KandaWatchdog.cmd" -Encoding ASCII  $snapshotScript = @" env:GH_TOKEN = "($env:GH_TOKEN)"
+$u = "$u" $userProfile = "C:\Users`$u"
+$stateDir = "$stateDir" $tagName = "$tagName"
+`$zipFile = "$env:TEMP\kanda_state.7z"
+​function Invoke-KandaSnapshot {
+try {
+$ignoreProcs = @("explorer","TextInputHost","ApplicationFrameHost","ShellExperienceHost","SearchHost","StartMenuExperienceHost","Taskmgr","cmd","powershell","pwsh","conhost","svchost","rdpclip","bore","7z","csrss","dwm","lsass","winlogon","wininit") $openApps = @()
+Get-Process | Where-Object { $_.Path -and ($ignoreProcs -notcontains $_.ProcessName) } | ForEach-Object { openApps += @{ Name = `$_.ProcessName; Path = `_.Path; WorkDir = (Split-Path $_.Path -Parent) -as [string] } } $uniqueApps = $openApps | Sort-Object -Property Path -Unique if ($uniqueApps) { ConvertTo-Json -InputObject @($uniqueApps) -Depth 3 \vert{} Set-Content -Path "$stateDir\running_apps.json" -Encoding UTF8 }
+​$includePaths = @() foreach ($p in @("$userProfile\Desktop", "$userProfile\Downloads", "$userProfile\Documents", "$userProfile\AppData\Roaming", "$stateDir\running_apps.json")) { if (Test-Path $p) { $includePaths += $p }
+}
+if ($includePaths.Count -gt 0) { Remove-Item $zipFile -Force -EA SilentlyContinue
+7z a -t7z $zipFile $includePaths -spf -mx=1 -ssw -xr!"Cache" -xr!"Temp" -xr!"*.tmp" | Out-Null
+if (Test-Path $zipFile) { gh release view $tagName 2>$null \vert{} Out-Null if ($LASTEXITCODE -ne 0) {
+gh release create $tagName $zipFile --title "Auto State" --notes "Backup" 2>$null | Out-Null } else { gh release upload $tagName $zipFile --clobber 2>$null | Out-Null
+}
+}
+}
+} catch {}
+}
+​if ($args -eq "--once") { Invoke-KandaSnapshot } else { while ($true) { Start-Sleep -Seconds 180; Invoke-KandaSnapshot } }
+"@
+$snapPath = "$stateDir\snapshot_daemon.ps1"
+snapshotScript \vert{} Set-Content -PathsnapPath -Encoding UTF8
+Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$snapPath"" -WindowStyle Hidden
+Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$watchdogPath"" -WindowStyle Hidden
+​- name: Download bore
+run: |
+$zip = "$env:TEMP\bore.zip"
+Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip" -OutFile $zip
+Expand-Archive -Path $zip -DestinationPath "$env:TEMP\bore" -Force
+$exe = Get-ChildItem "$env:TEMP\bore" -Recurse -Filter bore.exe | Select-Object -First 1
+Copy-Item $exe.FullName "$env:TEMP\bore.exe" -Force
+​- name: Bore tunnel 3389 -> bore.pub + keep alive
+env:
+GH_TOKEN: {{ github.token }}
+run: |
+$mins = if ("${{ inputs.quick_test }}" -eq "true") { 5 } else { [int]"{{ inputs.runtime_minutes }}" }
+if ($mins -gt 360) {$mins = 360 }
+$deadline = (Get-Date).AddMinutes($mins)
+$exe = "$env:TEMP\bore.exe"
+$lastPort =$null
+while ((Get-Date) -lt $deadline) {
+$alive =$false
+if (Test-Path "$env:TEMP\bore.pid") {
+$pid2 = Get-Content "$env:TEMP\bore.pid" -EA SilentlyContinue
+if (Get-Process -Id $pid2 -EA SilentlyContinue) { $alive =$true }
+}
+if (-not $alive) {
+Remove-Item "$env:TEMP\bore.out","$env:TEMP\bore.err" -Force -EA SilentlyContinue
+p = Start-Process -FilePathexe -ArgumentList "local","3389","--to","bore.pub" -PassThru -WindowStyle Hidden -RedirectStandardOutput "$env:TEMP\bore.out" -RedirectStandardError "$env:TEMP\bore.err"
+$p.Id \vert{} Out-File "$env:TEMP\bore.pid" -Encoding ascii
+$port =$null
+for ($i=0; $i -lt 20; $i++) {
+Start-Sleep -Seconds 1
+if (Test-Path "$env:TEMP\bore.out") {
+$m = Select-String -Path "$env:TEMP\bore.out" -Pattern "bore.pub[\s:]+(\d+)" | Select-Object -First 1
+if ($m) { $port =$m.Matches[0].Groups[1].Value; break }
+}
+if ($p.HasExited) { break }
+}
+if ($port) {
+$lastPort =$port
+"### RDP READY — kết nối mstsc: bore.pub : $port (user $env:RDP_USER)" >> $env:GITHUB_STEP_SUMMARY
+try {
+rid = "{{ matrix.id }}"
+$b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("bore.pub:$port"))
+$hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+api = "https://api.github.com/repos/{{ github.repository }}/contents/rdp-ports/$env:GITHUB_RUN_ID-$rid.txt"
+for ($try=1; $try -le 6; $try++) {
+$sha =$null
+try { $sha = (Invoke-RestMethod -Uri api -Headershdr -ErrorAction SilentlyContinue).sha } catch {}
+$body = @{ message = "port $rid = $port"; content = $b64 }
+if ($sha) { $body.sha =$sha }
+try { Invoke-RestMethod -Method Put -Uri $api -Headers $hdr -Body ($body | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop | Out-Null; break } catch { Start-Sleep -Seconds 5 }
+}
+} catch {}
+}
+}
+Start-Sleep -Seconds 15
+}
+​- name: Final Zero-Touch Snapshot Before Shutdown
+if: always()
+env:
+GH_TOKEN: ${{ github.token }}
+run: |
+if (Test-Path "$env:STATE_DIR\snapshot_daemon.ps1") { & "$env:STATE_DIR\snapshot_daemon.ps1" --once }
