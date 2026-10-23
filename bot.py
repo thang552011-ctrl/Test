@@ -76,8 +76,8 @@ async def fetch_github_username(gh_token: str) -> str:
         logger.warning(f"[GitHub] Lỗi lấy thông tin username: {e}")
     return "Token không hợp lệ hoặc hết hạn"
 
-async def scan_and_clean_rdp(gh_token: str, discord_user_id: str) -> list:
-    """Quét các repository, tự động xóa các repo ngừng hoạt động, trả về danh sách đang chạy."""
+async def scan_rdp_instances(gh_token: str, discord_user_id: str) -> list:
+    """Quét các repository (không xóa repo ngưng hoạt động), trả về danh sách đang chạy."""
     if not gh_token:
         return []
     headers = {
@@ -100,7 +100,6 @@ async def scan_and_clean_rdp(gh_token: str, discord_user_id: str) -> list:
                             continue
 
                         runs_url = f"https://api.github.com/repos/{owner}/{repo_name}/actions/runs?per_page=1"
-                        is_active = False
                         status = "Không hoạt động"
                         conclusion = "unknown"
                         
@@ -112,21 +111,8 @@ async def scan_and_clean_rdp(gh_token: str, discord_user_id: str) -> list:
                                     if runs:
                                         status = runs[0].get("status", "unknown")
                                         conclusion = runs[0].get("conclusion", "unknown")
-                                        if status in ["in_progress", "queued", "pending"]:
-                                            is_active = True
                         except Exception:
                             pass
-                        
-                        # Nếu không hoạt động -> Tự động xóa Repo
-                        if not is_active:
-                            del_url = f"https://api.github.com/repos/{owner}/{repo_name}"
-                            try:
-                                async with session.delete(del_url, headers=headers) as del_resp:
-                                    if del_resp.status in [200, 204]:
-                                        logger.info(f"[Auto-Clean] Đã xóa repo không hoạt động: {repo_name}")
-                            except Exception:
-                                pass
-                            continue
 
                         ports_info = []
                         ports_dir_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/rdp-ports"
@@ -171,15 +157,9 @@ async def deploy_rdp_real(gh_token: str, rdp_count: int = 1, user_id: str = "def
         "Accept": "application/vnd.github+json"
     }
     repo_name = f"ci-worker-{user_id}-{int(time.time())}"
-    owner = "octocat"
     
     async with aiohttp.ClientSession() as session:
-        user_url = "https://api.github.com/user"
-        async with session.get(user_url, headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                owner = data.get("login", owner)
-
+        # Bước 1: Tạo repo (Hỗ trợ gọi cả user endpoint và organization nếu cần)
         create_url = "https://api.github.com/user/repos"
         payload = {
             "name": repo_name,
@@ -188,7 +168,11 @@ async def deploy_rdp_real(gh_token: str, rdp_count: int = 1, user_id: str = "def
         }
         async with session.post(create_url, headers=headers, json=payload) as resp:
             if resp.status not in [200, 201]:
-                logger.warning(f"[GitHub] Không thể tạo repo {repo_name} (Có thể đã tồn tại)")
+                err_text = await resp.text()
+                logger.error(f"[GitHub] Không thể tạo repo {repo_name}: {resp.status} - {err_text}")
+                return {"ok": False, "error": err_text}
+            repo_data = await resp.json()
+            owner = repo_data.get("owner", {}).get("login", "")
 
         await asyncio.sleep(4)
 
@@ -206,7 +190,8 @@ async def deploy_rdp_real(gh_token: str, rdp_count: int = 1, user_id: str = "def
             "content": b64_content
         }
         async with session.put(wf_url, headers=headers, json=wf_payload) as resp:
-            pass
+            if resp.status not in [200, 201]:
+                logger.warning(f"[GitHub] Đẩy file workflow không thành công: {resp.status}")
 
         await asyncio.sleep(4)
 
@@ -227,7 +212,7 @@ async def deploy_rdp_real(gh_token: str, rdp_count: int = 1, user_id: str = "def
         "repo_full": f"{owner}/{repo_name}"
     }
 
-# ── Background Task: Auto Loop & Clean ──
+# ── Background Task: Auto Loop ──
 @tasks.loop(minutes=2)
 async def auto_loop_task():
     for filename in os.listdir(CONFIG_DIR):
@@ -238,7 +223,7 @@ async def auto_loop_task():
         gh_token = config.get("github_token")
         if not gh_token or not config.get("loop_enabled"): continue
         
-        active_instances = await scan_and_clean_rdp(gh_token, user_id)
+        active_instances = await scan_rdp_instances(gh_token, user_id)
         current_count = len(active_instances)
         target = config.get("target_rdp_count", 0)
         
@@ -316,7 +301,7 @@ class DataModeSelect(discord.ui.Select):
         save_user_config(user_id, config)
 
         gh_token = config.get("github_token")
-        active_list = await scan_and_clean_rdp(gh_token, str(user_id))
+        active_list = await scan_rdp_instances(gh_token, str(user_id))
         
         if len(active_list) + self.count > 20:
             await interaction.response.edit_message(content=f"❌ **Không thể tạo thêm!** Bạn đang chạy {len(active_list)} máy. Tối đa chỉ 20 máy.", view=None)
@@ -336,7 +321,8 @@ class DataModeSelect(discord.ui.Select):
                     ephemeral=True
                 )
             else:
-                await interaction.followup.send("❌ **Lỗi: Không tìm thấy file template `rdp-bore.yml` trên Server.**", ephemeral=True)
+                err_msg = res.get("error", "Lỗi không xác định")
+                await interaction.followup.send(f"❌ **Lỗi khi tạo repo trên GitHub:** `{err_msg}`", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(
                 f"❌ **Lỗi khi tạo RDP trên GitHub:** `{e}`",
@@ -424,7 +410,7 @@ async def send_rdp_menu(interaction: discord.Interaction, is_refresh=False):
         await interaction.response.defer(ephemeral=True)
 
     github_username = await fetch_github_username(gh_token)
-    active_instances = await scan_and_clean_rdp(gh_token, str(user_id))
+    active_instances = await scan_rdp_instances(gh_token, str(user_id))
 
     instances_text = ""
     if active_instances:
@@ -443,7 +429,8 @@ async def send_rdp_menu(interaction: discord.Interaction, is_refresh=False):
     loop_st = "🟢 BẬT" if config.get("loop_enabled") else "🔴 TẮT"
 
     menu_content = (
-        "```ansi\n\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n```\n"
+        "
+```ansi\n\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n```\n"
         f"👤 **Tài khoản GitHub:** `{github_username}`\n"
         f"🔁 **Auto Loop:** {loop_st} | 📊 **Tổng máy đang chạy:** {len(active_instances)}/20\n"
         f"{instances_text}"
@@ -512,3 +499,4 @@ if __name__ == "__main__":
         print("[!] Cảnh báo: Biến môi trường DISCORD_BOT_TOKEN chưa được thiết lập trên Railway!")
     else:
         bot.run(TOKEN)
+```eof
