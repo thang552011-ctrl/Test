@@ -35,8 +35,8 @@ def load_user_config(user_id: int) -> dict:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[Config] Lỗi đọc config user {user_id}: {e}")
     return {
         "github_token": "",
         "railway_token": "",
@@ -50,8 +50,11 @@ def load_user_config(user_id: int) -> dict:
 
 def save_user_config(user_id: int, config: dict):
     path = get_user_config_path(user_id)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"[Config] Lỗi ghi config user {user_id}: {e}")
 
 async def fetch_github_username(gh_token: str) -> str:
     if not gh_token:
@@ -97,37 +100,43 @@ async def scan_active_rdp_instances(gh_token: str, discord_user_id: str) -> list
                         runs_url = f"https://api.github.com/repos/{owner}/{repo_name}/actions/runs?per_page=1"
                         status = "Không hoạt động"
                         conclusion = "unknown"
-                        async with session.get(runs_url, headers=headers, timeout=5) as run_resp:
-                            if run_resp.status == 200:
-                                run_data = await run_resp.json()
-                                runs = run_data.get("workflow_runs", [])
-                                if runs:
-                                    status = runs[0].get("status", "unknown")
-                                    conclusion = runs[0].get("conclusion", "unknown")
+                        try:
+                            async with session.get(runs_url, headers=headers, timeout=5) as run_resp:
+                                if run_resp.status == 200:
+                                    run_data = await run_resp.json()
+                                    runs = run_data.get("workflow_runs", [])
+                                    if runs:
+                                        status = runs[0].get("status", "unknown")
+                                        conclusion = runs[0].get("conclusion", "unknown")
+                        except Exception:
+                            pass
 
                         ports_info = []
                         ports_dir_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/rdp-ports"
-                        async with session.get(ports_dir_url, headers=headers, timeout=5) as port_resp:
-                            if port_resp.status == 200:
-                                files = await port_resp.json()
-                                if isinstance(files, list):
-                                    for file_obj in files:
-                                        file_url = file_obj.get("download_url")
-                                        if file_url:
-                                            async with session.get(file_url, headers=headers, timeout=5) as f_res:
-                                                if f_res.status == 200:
-                                                    b64_data = await f_res.text()
-                                                    try:
-                                                        decoded_port = base64.b64decode(b64_data.strip()).decode('utf-8')
-                                                        ports_info.append({
-                                                            "slot": file_obj.get("name").replace(".txt", ""),
-                                                            "address": decoded_port
-                                                        })
-                                                    except Exception:
-                                                        ports_info.append({
-                                                            "slot": file_obj.get("name").replace(".txt", ""),
-                                                            "address": b64_data.strip()
-                                                        })
+                        try:
+                            async with session.get(ports_dir_url, headers=headers, timeout=5) as port_resp:
+                                if port_resp.status == 200:
+                                    files = await port_resp.json()
+                                    if isinstance(files, list):
+                                        for file_obj in files:
+                                            file_url = file_obj.get("download_url")
+                                            if file_url:
+                                                async with session.get(file_url, headers=headers, timeout=5) as f_res:
+                                                    if f_res.status == 200:
+                                                        b64_data = await f_res.text()
+                                                        try:
+                                                            decoded_port = base64.b64decode(b64_data.strip()).decode('utf-8')
+                                                            ports_info.append({
+                                                                "slot": file_obj.get("name").replace(".txt", ""),
+                                                                "address": decoded_port
+                                                            })
+                                                        except Exception:
+                                                            ports_info.append({
+                                                                "slot": file_obj.get("name").replace(".txt", ""),
+                                                                "address": b64_data.strip()
+                                                            })
+                        except Exception:
+                            pass
 
                         active_instances.append({
                             "repo": f"{owner}/{repo_name}",
@@ -344,7 +353,10 @@ class SettingsModal(discord.ui.Modal, title="⚙️ Cài Đặt Cấu Hình"):
         config = load_user_config(user_id)
         config["app_path"] = self.app_path.value.strip()
         config["keywords"] = [k.strip() for k in self.keywords.value.split(",") if k.strip()]
-        config["threads"] = int(self.threads.value or 1)
+        try:
+            config["threads"] = int(self.threads.value or 1)
+        except ValueError:
+            config["threads"] = 1
         config["license_key"] = self.license_key.value.strip() if self.license_key.value else ""
         save_user_config(user_id, config)
 
@@ -490,8 +502,10 @@ async def rdp_menu(interaction: discord.Interaction):
     else:
         instances_text = "\n📂 *Không tìm thấy máy RDP nào theo đúng quy ước đang hoạt động.*"
 
-    menu_content = "
-```ansi\n\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n```\n👤 **Tài khoản GitHub:** `{}`\n{}".format(github_username, instances_text)
+    menu_content = (
+        "```ansi\n\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n```\n"
+        f"👤 **Tài khoản GitHub:** `{github_username}`\n{instances_text}"
+    )
 
     view = RDPMenuView()
     await interaction.followup.send(content=menu_content, view=view, ephemeral=True)
@@ -519,4 +533,3 @@ if __name__ == "__main__":
         print("[!] Cảnh báo: Biến môi trường DISCORD_BOT_TOKEN chưa được thiết lập trên Railway!")
     else:
         bot.run(TOKEN)
-```eof
