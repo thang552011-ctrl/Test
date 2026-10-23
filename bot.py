@@ -16,7 +16,7 @@ from discord import app_commands
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("KandaBot")
 
-# ── Cấu hình Bot (Fallback Token nếu không dùng biến môi trường) ──
+# ── Cấu hình Bot (Đọc từ biến môi trường hoặc fallback) ──
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 
 intents = discord.Intents.default()
