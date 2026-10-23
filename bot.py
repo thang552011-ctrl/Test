@@ -424,7 +424,7 @@ async def send_rdp_menu(interaction: discord.Interaction, is_refresh=False):
         await interaction.response.defer(ephemeral=True)
 
     github_username = await fetch_github_username(gh_token)
-    active_instances = await scan_active_rdp_instances(gh_token, str(user_id))
+    active_instances = await scan_and_clean_rdp(gh_token, str(user_id))
 
     instances_text = ""
     if active_instances:
@@ -443,8 +443,7 @@ async def send_rdp_menu(interaction: discord.Interaction, is_refresh=False):
     loop_st = "🟢 BẬT" if config.get("loop_enabled") else "🔴 TẮT"
 
     menu_content = (
-        "
-```ansi\n\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n```\n"
+        "```ansi\n\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n```\n"
         f"👤 **Tài khoản GitHub:** `{github_username}`\n"
         f"🔁 **Auto Loop:** {loop_st} | 📊 **Tổng máy đang chạy:** {len(active_instances)}/20\n"
         f"{instances_text}"
@@ -513,4 +512,3 @@ if __name__ == "__main__":
         print("[!] Cảnh báo: Biến môi trường DISCORD_BOT_TOKEN chưa được thiết lập trên Railway!")
     else:
         bot.run(TOKEN)
-```eof
