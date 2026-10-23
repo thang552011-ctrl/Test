@@ -490,15 +490,8 @@ async def rdp_menu(interaction: discord.Interaction):
     else:
         instances_text = "\n📂 *Không tìm thấy máy RDP nào theo đúng quy ước đang hoạt động.*"
 
-    menu_content = (
-        "
-```ansi\n"
-        "\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n"
-        "
-```\n"
-        f"👤 **Tài khoản GitHub:** `{github_username}`\n"
-        f"{instances_text}"
-    )
+    menu_content = "
+```ansi\n\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n```\n👤 **Tài khoản GitHub:** `{}`\n{}".format(github_username, instances_text)
 
     view = RDPMenuView()
     await interaction.followup.send(content=menu_content, view=view, ephemeral=True)
