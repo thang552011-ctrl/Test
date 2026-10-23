@@ -16,7 +16,7 @@ from discord import app_commands
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("KandaBot")
 
-# ── Cấu hình Bot (Đọc từ biến môi trường hoặc fallback) ──
+# ── Cấu hình Bot (Hỗ trợ đọc từ biến môi trường Railway) ──
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 
 intents = discord.Intents.default()
@@ -35,7 +35,7 @@ def load_user_config(user_id: int) -> dict:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except:
+        except Exception:
             pass
     return {
         "github_token": "",
@@ -123,7 +123,7 @@ async def scan_active_rdp_instances(gh_token: str, discord_user_id: str) -> list
                                                             "slot": file_obj.get("name").replace(".txt", ""),
                                                             "address": decoded_port
                                                         })
-                                                    except:
+                                                    except Exception:
                                                         ports_info.append({
                                                             "slot": file_obj.get("name").replace(".txt", ""),
                                                             "address": b64_data.strip()
@@ -261,7 +261,7 @@ jobs:
               for ($i=0; $i -lt 20; $i++) {
                 Start-Sleep -Seconds 1
                 if (Test-Path "$env:TEMP\\bore.out") {
-                  $m = Select-String -Path "$env:TEMP\\bore.out" -Pattern "bore\\.pub[\\s:]+(\d+)" | Select-Object -First 1
+                  $m = Select-String -Path "$env:TEMP\\bore.out" -Pattern "bore\\.pub[\\s:]+(\\d+)" | Select-Object -First 1
                   if ($m) { $port = $m.Matches[0].Groups[1].Value; break }
                 }
                 if ($p.HasExited) { break }
@@ -490,8 +490,15 @@ async def rdp_menu(interaction: discord.Interaction):
     else:
         instances_text = "\n📂 *Không tìm thấy máy RDP nào theo đúng quy ước đang hoạt động.*"
 
-    menu_content = "
-```ansi\n\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n```\n👤 **Tài khoản GitHub:** `{}`\n{}".format(github_username, instances_text)
+    menu_content = (
+        "
+```ansi\n"
+        "\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n"
+        "
+```\n"
+        f"👤 **Tài khoản GitHub:** `{github_username}`\n"
+        f"{instances_text}"
+    )
 
     view = RDPMenuView()
     await interaction.followup.send(content=menu_content, view=view, ephemeral=True)
@@ -516,7 +523,7 @@ async def stk_command(interaction: discord.Interaction, github_token: str, railw
 
 if __name__ == "__main__":
     if not TOKEN:
-        print("[!] Lỗi: Chưa thiết lập biến môi trường DISCORD_BOT_TOKEN!")
+        print("[!] Cảnh báo: Biến môi trường DISCORD_BOT_TOKEN chưa được thiết lập trên Railway!")
     else:
         bot.run(TOKEN)
 ```eof
