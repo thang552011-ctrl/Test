@@ -1,4 +1,4 @@
-name: Kanda RDP Zero-Touch 24/7 (Watchdog & Defender Bypass)
+name: Kanda RDP Zero-Touch 24/7
 
 on:
   workflow_dispatch:
@@ -88,7 +88,7 @@ jobs:
           USER_ID: ${{ inputs.user_id }}
           DATA_MODE: ${{ inputs.data_mode }}
         run: |
-          $tagName = if ($env:DATA_MODE -eq "chung") { "kanda-state-chung" } else { "kanda-state-$env:USER_ID" }
+          $tagName = if ("${{ inputs.data_mode }}" -eq "chung") { "kanda-state-chung" } else { "kanda-state-${{ inputs.user_id }}" }
           $zipFile = "$env:TEMP\kanda_state.7z"
           Write-Host "[+] Đang tải Data từ tag: $tagName"
           try {
@@ -98,7 +98,7 @@ jobs:
                   Write-Host "[+] Khôi phục Data thành công!"
               }
           } catch {
-              Write-Host "[i] Không tìm thấy Data cũ, tạo máy tính mới hoàn toàn."
+              Write-Host "[i] Không tìm thấy Data cũ hoặc chưa có release, tạo máy tính mới hoàn toàn."
           }
 
       - name: Continuous Data Snapshot Daemon (Watchdog)
@@ -183,4 +183,3 @@ jobs:
             }
             Start-Sleep -Seconds 15
           }
-```eof
