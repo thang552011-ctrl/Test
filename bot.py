@@ -343,27 +343,33 @@ async def trigger_workflow_on_repo(
         return resp.status in [201, 204]
 
 
-async def deploy_rdp_real(gh_token: str, rdp_count: int = 1, user_id: str = "default", data_mode: str = "chung"):
+async def deploy_rdp_real(
+    gh_token: str,
+    rdp_count: int = 1,
+    user_id: str = "default",
+    data_mode: str = "chung",
+    force_new_repo: bool = False
+):
     """
     Ưu tiên tái sử dụng Repo cũ đã ngừng chạy (để lấy lại bản backup kanda_state.7z trên GitHub Release).
-    Nếu chưa có Repo nào thì mới tạo Repo mới.
+    Nếu chưa có Repo nào hoặc force_new_repo=True thì tạo Repo mới hoàn toàn.
     """
-    # Kiểm tra xem user đã có sẵn repo ci-worker nào đang nghỉ (inactive) hay chưa
-    all_repos = await scan_rdp_instances(gh_token, str(user_id), include_inactive=True)
-    inactive_repos = [r for r in all_repos if not r.get("is_active")]
+    if not force_new_repo:
+        all_repos = await scan_rdp_instances(gh_token, str(user_id), include_inactive=True)
+        inactive_repos = [r for r in all_repos if not r.get("is_active")]
 
-    if inactive_repos:
-        reuse_repo = inactive_repos[0]["repo"]
-        logger.info(f"[Zero-Touch] Tái sử dụng repo {reuse_repo} để khôi phục dữ liệu từ Release...")
-        ok = await trigger_workflow_on_repo(
-            gh_token=gh_token,
-            repo_full=reuse_repo,
-            rdp_count=rdp_count,
-            user_id=str(user_id),
-            data_mode=data_mode
-        )
-        if ok:
-            return {"ok": True, "repo_full": reuse_repo, "reused": True}
+        if inactive_repos:
+            reuse_repo = inactive_repos[0]["repo"]
+            logger.info(f"[Zero-Touch] Tái sử dụng repo {reuse_repo} để khôi phục dữ liệu từ Release...")
+            ok = await trigger_workflow_on_repo(
+                gh_token=gh_token,
+                repo_full=reuse_repo,
+                rdp_count=rdp_count,
+                user_id=str(user_id),
+                data_mode=data_mode
+            )
+            if ok:
+                return {"ok": True, "repo_full": reuse_repo, "reused": True}
 
     headers = {
         "Authorization": f"Bearer {gh_token}",
@@ -372,7 +378,7 @@ async def deploy_rdp_real(gh_token: str, rdp_count: int = 1, user_id: str = "def
     repo_name = f"ci-worker-{user_id}-{int(time.time())}"
     session = await get_session()
 
-    # Bước 1: Tạo repo mới nếu chưa có repo nào để tái sử dụng
+    # Bước 1: Tạo repo mới
     create_url = "https://api.github.com/user/repos"
     payload = {
         "name": repo_name,
@@ -428,6 +434,87 @@ async def deploy_rdp_real(gh_token: str, rdp_count: int = 1, user_id: str = "def
     }
 
 
+async def stop_all_rdp_instances(gh_token: str, discord_user_id: str) -> dict:
+    """
+    Dừng toàn bộ các workflow RDP đang chạy của người dùng (Cancel workflow runs).
+    Trả về số cụm repo và tổng số máy đã được dừng.
+    """
+    active_instances = await scan_rdp_instances(gh_token, discord_user_id, include_inactive=False)
+    if not active_instances:
+        return {"stopped_repos": 0, "stopped_slots": 0}
+
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github+json"
+    }
+    session = await get_session()
+
+    async def cancel_repo_runs(inst):
+        repo_full = inst["repo"]
+        stopped = False
+        # Hủy run_id hiện tại
+        if inst.get("run_id"):
+            cancel_url = f"https://api.github.com/repos/{repo_full}/actions/runs/{inst['run_id']}/cancel"
+            try:
+                async with session.post(cancel_url, headers=headers, timeout=8) as resp:
+                    if resp.status in [202, 200, 204]:
+                        stopped = True
+            except Exception:
+                pass
+
+        # Quét thêm các run đang in_progress hoặc queued khác trong repo đó để hủy triệt để
+        for st in ["in_progress", "queued", "waiting"]:
+            runs_url = f"https://api.github.com/repos/{repo_full}/actions/runs?status={st}&per_page=10"
+            try:
+                async with session.get(runs_url, headers=headers, timeout=6) as r_resp:
+                    if r_resp.status == 200:
+                        r_data = await r_resp.json()
+                        for run_obj in r_data.get("workflow_runs", []):
+                            rid = run_obj.get("id")
+                            if rid:
+                                c_url = f"https://api.github.com/repos/{repo_full}/actions/runs/{rid}/cancel"
+                                async with session.post(c_url, headers=headers, timeout=6) as c_resp:
+                                    if c_resp.status in [202, 200, 204]:
+                                        stopped = True
+            except Exception:
+                pass
+        return inst.get("slot_count", 1) if stopped else 0
+
+    results = await asyncio.gather(*(cancel_repo_runs(inst) for inst in active_instances))
+    stopped_repos = sum(1 for slots in results if slots > 0)
+    stopped_slots = sum(results)
+    return {
+        "stopped_repos": stopped_repos,
+        "stopped_slots": stopped_slots
+    }
+
+
+async def delete_all_rdp_repos(gh_token: str, discord_user_id: str) -> int:
+    """
+    Xóa toàn bộ tất cả các repository RDP (cả đang chạy lẫn đã tắt) của user để tái tạo mới.
+    """
+    all_instances = await scan_rdp_instances(gh_token, discord_user_id, include_inactive=True)
+    if not all_instances:
+        return 0
+
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github+json"
+    }
+    session = await get_session()
+
+    async def delete_repo(inst):
+        del_url = f"https://api.github.com/repos/{inst['repo']}"
+        try:
+            async with session.delete(del_url, headers=headers, timeout=8) as resp:
+                return resp.status in [204, 200]
+        except Exception:
+            return False
+
+    del_results = await asyncio.gather(*(delete_repo(inst) for inst in all_instances))
+    return sum(1 for success in del_results if success)
+
+
 async def cleanup_inactive_repos(gh_token: str, discord_user_id: str, keep_latest_one: bool = True) -> int:
     """
     Dọn dẹp các repo cũ đã ngừng hoạt động.
@@ -437,7 +524,6 @@ async def cleanup_inactive_repos(gh_token: str, discord_user_id: str, keep_lates
     inactive_list = [inst for inst in all_instances if not inst.get("is_active")]
 
     if keep_latest_one and len(inactive_list) > 0:
-        # Giữ lại repo đầu tiên (mới cập nhật nhất) để không mất Release backup
         inactive_list = inactive_list[1:]
 
     if not inactive_list:
@@ -479,7 +565,6 @@ async def _process_user_rdp_loop(user_id_str: str, config: dict):
     inactive_instances = [inst for inst in all_instances if not inst.get("is_active")]
 
     # 1. Kiểm tra các repo sắp hết hạn (còn <= 10 phút trước khi Bore đóng ở phút 355)
-    restarted_slots = 0
     for inst in active_instances:
         if inst["status"] == "in_progress" and inst.get("remain_min", 355) <= RDP_PREWARM_THRESHOLD_MIN:
             slots = inst.get("slot_count", 1)
@@ -487,7 +572,7 @@ async def _process_user_rdp_loop(user_id_str: str, config: dict):
                 f"[Auto-Loop] Repo {inst['repo']} của user {user_id_str} chỉ còn {inst['remain_min']} phút. "
                 f"Đang xoay vòng (Re-dispatch) ngay trên repo này để giữ Data..."
             )
-            ok = await trigger_workflow_on_repo(
+            await trigger_workflow_on_repo(
                 gh_token=gh_token,
                 repo_full=inst["repo"],
                 rdp_count=slots,
@@ -495,10 +580,8 @@ async def _process_user_rdp_loop(user_id_str: str, config: dict):
                 data_mode=data_mode,
                 cancel_run_id=inst.get("run_id")
             )
-            if ok:
-                restarted_slots += slots
 
-    # 2. Tính tổng số slot đang chạy (bao gồm cả các slot vừa được xoay vòng)
+    # 2. Tính tổng số slot đang chạy
     current_count = sum(inst.get("slot_count", 1) for inst in active_instances)
 
     if current_count < target:
@@ -724,14 +807,98 @@ class RDPMenuView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label="Cài đặt", style=discord.ButtonStyle.secondary, emoji="⚙️", row=0)
+    @discord.ui.button(label="Tái Tạo RDP", style=discord.ButtonStyle.primary, emoji="♻️", row=0)
+    async def btn_recreate(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        uid = interaction.user.id
+        conf = load_user_config(uid)
+        gh_token = conf.get("github_token")
+        if not gh_token:
+            await interaction.followup.send("❌ Bạn chưa liên kết GitHub Token!", ephemeral=True)
+            return
+
+        # Kiểm tra số lượng máy đang chạy hoặc mục tiêu đã cài đặt
+        active_list = await scan_rdp_instances(gh_token, str(uid), include_inactive=False)
+        running_slots = sum(inst.get("slot_count", 1) for inst in active_list)
+        recreate_count = conf.get("target_rdp_count", 0) or running_slots or 1
+        recreate_count = min(20, max(1, int(recreate_count)))
+        data_mode = conf.get("data_mode", "chung")
+
+        await interaction.followup.send(
+            f"♻️ **Đang xóa toàn bộ RDP cũ và tái tạo mới `{recreate_count}` máy RDP (Chế độ: `{data_mode.upper()}`)...**",
+            ephemeral=True
+        )
+
+        # Bước 1: Xóa sạch toàn bộ repo RDP hiện có (đang chạy + đã tắt)
+        deleted_count = await delete_all_rdp_repos(gh_token, str(uid))
+        await asyncio.sleep(2)
+
+        # Bước 2: Khởi tạo repo mới hoàn toàn
+        res = await deploy_rdp_real(
+            gh_token=gh_token,
+            rdp_count=recreate_count,
+            user_id=str(uid),
+            data_mode=data_mode,
+            force_new_repo=True
+        )
+        if res.get("ok"):
+            conf["target_rdp_count"] = recreate_count
+            save_user_config(uid, conf)
+            await interaction.followup.send(
+                f"✅ **Tái tạo RDP hoàn tất!**\n"
+                f"• Đã xóa sạch `{deleted_count}` repository cũ.\n"
+                f"• Đã dựng mới **{recreate_count} máy RDP** tại repo: `{res.get('repo_full')}`.\n"
+                f"• Nhấn nút **🔄 Làm Mới** sau 1-2 phút để nhận cổng `mstsc` mới!",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ **Đã xóa `{deleted_count}` repo cũ nhưng gặp lỗi khi tạo repo mới:** `{res.get('error')}`",
+                ephemeral=True
+            )
+
+    @discord.ui.button(label="Dừng Tất Cả RDP", style=discord.ButtonStyle.danger, emoji="🛑", row=0)
+    async def btn_stop_all(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        uid = interaction.user.id
+        conf = load_user_config(uid)
+        gh_token = conf.get("github_token")
+        if not gh_token:
+            await interaction.followup.send("❌ Bạn chưa liên kết GitHub Token!", ephemeral=True)
+            return
+
+        # Tắt luôn Auto Loop để bot không tự động bật lại máy sau khi người dùng bấm Dừng
+        was_looping = conf.get("loop_enabled", False)
+        if was_looping:
+            conf["loop_enabled"] = False
+            save_user_config(uid, conf)
+
+        stop_res = await stop_all_rdp_instances(gh_token, str(uid))
+        stopped_repos = stop_res.get("stopped_repos", 0)
+        stopped_slots = stop_res.get("stopped_slots", 0)
+
+        loop_note = "\n*(Đã tự động **TẮT Auto Loop** để hệ thống không tự bật lại máy)*" if was_looping else ""
+
+        if stopped_repos > 0:
+            await interaction.followup.send(
+                f"🛑 **Đã gửi lệnh dừng toàn bộ `{stopped_slots}` máy RDP** trên `{stopped_repos}` cụm repository!{loop_note}\n"
+                f"*(Dữ liệu trên GitHub Release vẫn được giữ nguyên. Bấm **🔄 Làm Mới** để cập nhật bảng trạng thái)*.",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"ℹ️ **Hiện không có máy RDP nào đang chạy để dừng.**{loop_note}",
+                ephemeral=True
+            )
+
+    @discord.ui.button(label="Làm Mới", style=discord.ButtonStyle.secondary, emoji="🔄", row=0)
+    async def btn_refresh(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        await send_rdp_menu(interaction, is_refresh=True)
+
+    @discord.ui.button(label="Cài đặt", style=discord.ButtonStyle.secondary, emoji="⚙️", row=1)
     async def btn_settings(self, interaction: discord.Interaction, btn: discord.ui.Button):
         fresh_config = load_user_config(interaction.user.id)
         await interaction.response.send_modal(SettingsModal(fresh_config))
-
-    @discord.ui.button(label="Làm Mới", style=discord.ButtonStyle.primary, emoji="🔄", row=0)
-    async def btn_refresh(self, interaction: discord.Interaction, btn: discord.ui.Button):
-        await send_rdp_menu(interaction, is_refresh=True)
 
     @discord.ui.button(label="Auto Loop: Bật/Tắt", style=discord.ButtonStyle.secondary, emoji="🔁", row=1)
     async def btn_loop(self, interaction: discord.Interaction, btn: discord.ui.Button):
