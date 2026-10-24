@@ -90,15 +90,20 @@ jobs:
         run: |
           $tagName = if ("${{ inputs.data_mode }}" -eq "chung") { "kanda-state-chung" } else { "kanda-state-${{ inputs.user_id }}" }
           $zipFile = "$env:TEMP\kanda_state.7z"
-          Write-Host "[+] Đang tải Data từ tag: $tagName"
+          Write-Host "[+] Đang kiểm tra dữ liệu từ tag: $tagName"
           try {
-              gh release download $tagName --pattern "kanda_state.7z" --dir "$env:TEMP" --clobber 2>$null
-              if (Test-Path $zipFile) { 
-                  7z x $zipFile -o"C:\" -y | Out-Null
-                  Write-Host "[+] Khôi phục Data thành công!"
+              $releaseInfo = gh release view $tagName 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                  gh release download $tagName --pattern "kanda_state.7z" --dir "$env:TEMP" --clobber 2>$null
+                  if (Test-Path $zipFile) { 
+                      7z x $zipFile -o"C:\" -y | Out-Null
+                      Write-Host "[+] Khôi phục Data thành công!"
+                  }
+              } else {
+                  Write-Host "[i] Chưa có bản backup cũ trên Release, tiến hành tạo mới sạch sẽ."
               }
           } catch {
-              Write-Host "[i] Không tìm thấy Data cũ hoặc chưa có release, tạo máy tính mới hoàn toàn."
+              Write-Host "[i] Bỏ qua khôi phục dữ liệu cũ, tiếp tục khởi động máy."
           }
 
       - name: Continuous Data Snapshot Daemon (Watchdog)
