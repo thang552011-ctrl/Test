@@ -18,13 +18,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("KandaBot")
 
-# ── Cấu hình Bot ──
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 CONFIG_DIR = "./user_configs"
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
 RDP_BORE_LIFETIME_MIN = 355
-RDP_PREWARM_THRESHOLD_MIN = 10
+RDP_PREWARM_THRESHOLD_MIN = 15
 
 _rdp_loop_busy = set()
 
@@ -326,6 +325,244 @@ async def trigger_workflow_on_repo(
         return resp.status in [201, 204]
 
 
+WORKFLOW_YAML_CONTENT = """name: Kanda RDP Zero-Touch 24/7
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_count:
+        description: "How many RDP instances (1-20)"
+        required: false
+        default: "1"
+      user_id:
+        description: "Workspace Bucket ID (UID Discord)"
+        required: false
+        default: "default_user"
+      data_mode:
+        description: "Chế độ Data (chung / rieng)"
+        required: false
+        default: "chung"
+      app_path:
+        description: "Đường dẫn phần mềm tự chạy trên RDP"
+        required: false
+        default: ""
+      keywords:
+        description: "Từ khóa vượt menu"
+        required: false
+        default: "Login,START"
+      threads:
+        description: "Số luồng chạy"
+        required: false
+        default: "1"
+      license_key:
+        description: "Key bản quyền"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        run: |
+          $n = [int]"${{ inputs.rdp_count }}"; if ($n -lt 1) { $n = 1 }; if ($n -gt 20) { $n = 20 }
+          $inc = @(); for ($i=1; $i -le $n; $i++){ $inc += @{ id = $i } }
+          "matrix=$(@{ include = $inc } | ConvertTo-Json -Compress)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  rdp:
+    needs: setup
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      max-parallel: 20
+    timeout-minutes: 370
+    env:
+      RDP_USER: Thang
+      RDP_PASS: Thang12345@
+      STATE_DIR: C:\\KandaState
+      SLOT_ID: ${{ matrix.id }}
+    steps:
+      - name: Enable RDP user + Admin Rights
+        run: |
+          $secFile = "$env:TEMP\\secedit.cfg"; $secNew = "$env:TEMP\\secedit_new.cfg"
+          secedit /export /cfg $secFile /quiet 2>$null
+          if (Test-Path $secFile) {
+            (Get-Content $secFile) -replace 'PasswordComplexity = 1','PasswordComplexity = 0' -replace 'MinimumPasswordLength = \\d+','MinimumPasswordLength = 0' | Set-Content $secNew
+            secedit /configure /db secedit.sdb /cfg $secNew /quiet 2>$null
+          }
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+            Add-LocalGroupMember -Group "Administrators" -Member $u -EA SilentlyContinue
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -EA SilentlyContinue
+          }
+          Set-ItemProperty "HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      - name: Ultimate Performance & Total Windows Defender Bypass
+        run: |
+          try {
+            reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
+            Set-MpPreference -DisableRealtimeMonitoring $true -EA SilentlyContinue
+            Set-MpPreference -DisableBehaviorMonitoring $true -EA SilentlyContinue
+            Add-MpPreference -ExclusionPath "C:\\" -EA SilentlyContinue
+            Stop-Service -Name WinDefend -Force -EA SilentlyContinue
+            Set-Service -Name WinDefend -StartupType Disabled -EA SilentlyContinue
+          } catch {}
+
+      - name: Zero-Touch Data Restore (Chung / Riêng từng Slot)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          USER_ID: ${{ inputs.user_id }}
+          DATA_MODE: ${{ inputs.data_mode }}
+          SLOT_ID: ${{ matrix.id }}
+        run: |
+          $tagName = if ("$env:DATA_MODE" -eq "chung") { "kanda-state-chung" } else { "kanda-state-$env:USER_ID-slot-$env:SLOT_ID" }
+          $zipFile = "$env:TEMP\\kanda_state.7z"
+          Write-Host "[+] Đang kiểm tra dữ liệu từ tag: $tagName"
+          try {
+              gh release download $tagName --pattern "kanda_state.7z" --dir "$env:TEMP" --clobber 2>$null
+              if (Test-Path $zipFile) { 
+                  7z x $zipFile -o"C:\\" -y | Out-Null
+                  Write-Host "[+] Khôi phục Data thành công cho Slot $env:SLOT_ID!"
+              } else {
+                  Write-Host "[i] Không tìm thấy file backup trong release, khởi động máy mới."
+              }
+          } catch {
+              Write-Host "[i] Chưa có dữ liệu cũ trên Release, tiến hành tạo máy mới sạch sẽ."
+          }
+          exit 0
+
+      - name: Auto-Launch Configured Tool & Apply Settings
+        env:
+          APP_PATH: ${{ inputs.app_path }}
+          KEYWORDS: ${{ inputs.keywords }}
+          THREADS: ${{ inputs.threads }}
+          LICENSE_KEY: ${{ inputs.license_key }}
+        run: |
+          New-Item -ItemType Directory -Force -Path "C:\\KandaState" | Out-Null
+          $cfgObj = @{
+            app_path = $env:APP_PATH
+            keywords = ($env:KEYWORDS -split ",")
+            threads = $env:THREADS
+            license_key = $env:LICENSE_KEY
+            slot_id = $env:SLOT_ID
+          }
+          $cfgObj | ConvertTo-Json -Depth 3 | Set-Content -Path "C:\\KandaState\\bot_settings.json" -Encoding UTF8
+          if (-not [string]::IsNullOrWhiteSpace($env:APP_PATH) -and (Test-Path $env:APP_PATH)) {
+            Write-Host "[+] Phát hiện phần mềm tại $env:APP_PATH, đang khởi chạy..."
+            $workDir = Split-Path -Parent $env:APP_PATH
+            Start-Process -FilePath $env:APP_PATH -WorkingDirectory $workDir -EA SilentlyContinue
+          }
+
+      - name: Continuous Data Snapshot Daemon (Watchdog)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          USER_ID: ${{ inputs.user_id }}
+          DATA_MODE: ${{ inputs.data_mode }}
+          SLOT_ID: ${{ matrix.id }}
+        run: |
+          $daemonScript = @'
+          $tagName = if ("$env:DATA_MODE" -eq "chung") { "kanda-state-chung" } else { "kanda-state-$env:USER_ID-slot-$env:SLOT_ID" }
+          $zipFile = "$env:TEMP\\kanda_state_$env:SLOT_ID.7z"
+          $uploadFile = "$env:TEMP\\kanda_state.7z"
+          $userProfile = "C:\\Users\\$env:RDP_USER"
+          while ($true) {
+              Start-Sleep -Seconds 300
+              try {
+                  if ("$env:DATA_MODE" -eq "chung" -and "$env:SLOT_ID" -ne "1") {
+                      continue
+                  }
+                  Remove-Item $zipFile, $uploadFile -Force -EA SilentlyContinue
+                  7z a -t7z $zipFile "$userProfile\\Desktop" "$userProfile\\Downloads" "$userProfile\\Documents" -spf -mx=1 -ssw | Out-Null
+                  if (Test-Path $zipFile) {
+                      Copy-Item $zipFile $uploadFile -Force
+                      gh release view $tagName 2>$null | Out-Null
+                      if ($LASTEXITCODE -ne 0) {
+                          gh release create $tagName $uploadFile --title "Auto State ($tagName)" --notes "Backup Slot $env:SLOT_ID" 2>$null | Out-Null
+                      } else {
+                          gh release upload $tagName $uploadFile --clobber 2>$null | Out-Null
+                      }
+                  }
+              } catch {}
+          }
+          '@
+          $daemonPath = "C:\\KandaState\\snapshot_daemon.ps1"
+          New-Item -ItemType Directory -Force -Path "C:\\KandaState" | Out-Null
+          $daemonScript | Set-Content -Path $daemonPath -Encoding UTF8
+          Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$daemonPath`"" -WindowStyle Hidden
+
+      - name: Download bore
+        run: |
+          $zip = "$env:TEMP\\bore.zip"
+          Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:TEMP\\bore" -Force
+          $exe = Get-ChildItem "$env:TEMP\\bore" -Recurse -Filter bore.exe | Select-Object -First 1
+          Copy-Item $exe.FullName "$env:TEMP\\bore.exe" -Force
+
+      - name: Bore tunnel 3389 -> bore.pub + report port
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $deadline = (Get-Date).AddMinutes(355)
+          $exe = "$env:TEMP\\bore.exe"
+          while ((Get-Date) -lt $deadline) {
+            $alive = $false
+            if (Test-Path "$env:TEMP\\bore.pid") {
+              $pid2 = Get-Content "$env:TEMP\\bore.pid" -EA SilentlyContinue
+              if (Get-Process -Id $pid2 -EA SilentlyContinue) { $alive = $true }
+            }
+            if (-not $alive) {
+              Remove-Item "$env:TEMP\\bore.out","$env:TEMP\\bore.err" -Force -EA SilentlyContinue
+              $p = Start-Process -FilePath $exe -ArgumentList "local","3389","--to","bore.pub" -PassThru -WindowStyle Hidden -RedirectStandardOutput "$env:TEMP\\bore.out" -RedirectStandardError "$env:TEMP\\bore.err"
+              $p.Id | Out-File "$env:TEMP\\bore.pid" -Encoding ascii
+              $port = $null
+              for ($i=0; $i -lt 20; $i++) {
+                Start-Sleep -Seconds 1
+                if (Test-Path "$env:TEMP\\bore.out") {
+                  $m = Select-String -Path "$env:TEMP\\bore.out" -Pattern "bore\\.pub[\\s:]+(\d+)" | Select-Object -First 1
+                  if ($m) { $port = $m.Matches[0].Groups[1].Value; break }
+                }
+                if ($p.HasExited) { break }
+              }
+              if ($port) {
+                try {
+                  $rid = "${{ matrix.id }}"
+                  $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("bore.pub:$port"))
+                  $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+                  $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/contents/rdp-ports/$rid.txt"
+                  for ($try=1; $try -le 6; $try++) {
+                    $sha = $null
+                    try { $sha = (Invoke-RestMethod -Uri $api -Headers $hdr -ErrorAction SilentlyContinue).sha } catch {}
+                    $body = @{ message = "port slot $rid = $port"; content = $b64 }
+                    if ($sha) { $body.sha = $sha }
+                    try { Invoke-RestMethod -Method Put -Uri $api -Headers $hdr -Body ($body | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop | Out-Null; break } catch { Start-Sleep -Seconds 5 }
+                  }
+                } catch {}
+              }
+            }
+            Start-Sleep -Seconds 15
+          }
+"""
+
+
 async def deploy_rdp_real(
     gh_token: str,
     rdp_count: int = 1,
@@ -371,17 +608,10 @@ async def deploy_rdp_real(
         repo_data = await resp.json()
         owner = repo_data.get("owner", {}).get("login", "")
 
-    await asyncio.sleep(3)
-
-    try:
-        with open(".github/workflows/rdp-bore.yml", "r", encoding="utf-8") as f:
-            workflow_content = f.read()
-    except Exception:
-        logger.error("Không tìm thấy file template .github/workflows/rdp-bore.yml")
-        return {"ok": False, "error": "Missing template file (.github/workflows/rdp-bore.yml)"}
+    await asyncio.sleep(4)
 
     wf_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/.github/workflows/rdp-bore.yml"
-    b64_content = base64.b64encode(workflow_content.encode("utf-8")).decode("utf-8")
+    b64_content = base64.b64encode(WORKFLOW_YAML_CONTENT.encode("utf-8")).decode("utf-8")
     wf_payload = {
         "message": "Add Kanda RDP Workflow",
         "content": b64_content
@@ -392,7 +622,7 @@ async def deploy_rdp_real(
             logger.warning(f"[GitHub] Đẩy file workflow không thành công: {resp.status} - {err_wf}")
             return {"ok": False, "error": f"Upload workflow lỗi: {resp.status}"}
 
-    await asyncio.sleep(3)
+    await asyncio.sleep(4)
 
     repo_full = f"{owner}/{repo_name}"
     await trigger_workflow_on_repo(
