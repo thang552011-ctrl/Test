@@ -2,42 +2,69 @@ import asyncio
 import base64
 import json
 import os
-import random
+import re
 import time
-import uuid
 import logging
+from datetime import datetime, timezone
 import aiohttp
-from pathlib import Path
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 
 # ── Logging Setup ──
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 logger = logging.getLogger("KandaBot")
 
-# ── Cấu hình Bot (Hỗ trợ đọc từ biến môi trường Railway) ──
+# ── Cấu hình Bot ──
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-
 CONFIG_DIR = "./user_configs"
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
+# Thời gian tối đa của Bore tunnel trong file .yml là 355 phút.
+# Khi còn <= 10 phút (tức đã chạy >= 345 phút), bot sẽ tự động xoay vòng (re-dispatch) ngay trên repo đó.
+RDP_BORE_LIFETIME_MIN = 355
+RDP_PREWARM_THRESHOLD_MIN = 10
+
+# Chốt chống trùng lặp khi xử lý Auto Loop cho từng user
+_rdp_loop_busy = set()
+
+
+# ── Custom Bot Class (Quản lý ClientSession tập trung) ──
+class KandaBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix="!", intents=intents)
+        self.http_session: aiohttp.ClientSession = None
+
+    async def setup_hook(self):
+        self.http_session = aiohttp.ClientSession()
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"[+] Đã đồng bộ {len(synced)} slash commands thành công!")
+        except Exception as e:
+            logger.error(f"[!] Lỗi đồng bộ command: {e}")
+
+    async def close(self):
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
+        await super().close()
+
+
+bot = KandaBot()
+
+
+# ── Quản lý File Cấu Hình ──
 def get_user_config_path(user_id: int) -> str:
     return os.path.join(CONFIG_DIR, f"{user_id}.json")
 
+
 def load_user_config(user_id: int) -> dict:
     path = get_user_config_path(user_id)
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.warning(f"[Config] Lỗi đọc config user {user_id}: {e}")
-    return {
+    default_config = {
         "github_token": "",
         "railway_token": "",
         "app_path": r"C:\Users\Thang\Desktop\AutoTool\Tool.exe",
@@ -49,6 +76,16 @@ def load_user_config(user_id: int) -> dict:
         "loop_enabled": False,
         "target_rdp_count": 0
     }
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                default_config.update(data)
+                return default_config
+        except Exception as e:
+            logger.warning(f"[Config] Lỗi đọc config user {user_id}: {e}")
+    return default_config
+
 
 def save_user_config(user_id: int, config: dict):
     path = get_user_config_path(user_id)
@@ -57,6 +94,14 @@ def save_user_config(user_id: int, config: dict):
             json.dump(config, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"[Config] Lỗi ghi config user {user_id}: {e}")
+
+
+# ── Các Hàm Tương Tác GitHub API Bất Đồng Bộ Tốc Độ Cao ──
+async def get_session() -> aiohttp.ClientSession:
+    if bot.http_session is None or bot.http_session.closed:
+        bot.http_session = aiohttp.ClientSession()
+    return bot.http_session
+
 
 async def fetch_github_username(gh_token: str) -> str:
     if not gh_token:
@@ -67,204 +112,495 @@ async def fetch_github_username(gh_token: str) -> str:
         "Accept": "application/vnd.github+json"
     }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("login", "Không rõ")
+        session = await get_session()
+        async with session.get(url, headers=headers, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("login", "Không rõ")
     except Exception as e:
         logger.warning(f"[GitHub] Lỗi lấy thông tin username: {e}")
     return "Token không hợp lệ hoặc hết hạn"
 
-async def scan_rdp_instances(gh_token: str, discord_user_id: str) -> list:
-    """Quét các repository (không xóa repo ngưng hoạt động), trả về danh sách đang chạy."""
+
+async def fetch_single_port_file(session: aiohttp.ClientSession, file_obj: dict, headers: dict):
+    """Đọc nội dung 1 file port song song."""
+    file_url = file_obj.get("download_url")
+    slot_name = file_obj.get("name", "").replace(".txt", "")
+    if not file_url:
+        return None
+    try:
+        async with session.get(file_url, headers=headers, timeout=5) as f_res:
+            if f_res.status == 200:
+                b64_data = (await f_res.text()).strip()
+                try:
+                    decoded_port = base64.b64decode(b64_data).decode("utf-8").strip()
+                except Exception:
+                    decoded_port = b64_data
+                return {
+                    "slot": slot_name,
+                    "address": decoded_port
+                }
+    except Exception:
+        pass
+    return None
+
+
+def calculate_remain_minutes(run_started_at_iso: str) -> int:
+    """Tính số phút còn lại của phiên RDP (dựa trên mốc 355 phút của Bore tunnel)."""
+    if not run_started_at_iso:
+        return RDP_BORE_LIFETIME_MIN
+    try:
+        dt = datetime.fromisoformat(run_started_at_iso.replace("Z", "+00:00"))
+        elapsed_min = (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+        return max(0, int(RDP_BORE_LIFETIME_MIN - elapsed_min))
+    except Exception:
+        return RDP_BORE_LIFETIME_MIN
+
+
+async def inspect_single_repo(session: aiohttp.ClientSession, repo: dict, headers: dict):
+    """Kiểm tra trạng thái workflow, thời gian còn lại và danh sách port của 1 repo."""
+    repo_name = repo.get("name", "")
+    owner = repo.get("owner", {}).get("login", "")
+    description = repo.get("description") or ""
+
+    expected_slots = 1
+    match = re.search(r"\[SLOTS:(\d+)\]", description)
+    if match:
+        expected_slots = int(match.group(1))
+
+    runs_url = f"https://api.github.com/repos/{owner}/{repo_name}/actions/runs?per_page=1"
+    status = "unknown"
+    conclusion = None
+    run_id = None
+    remain_min = RDP_BORE_LIFETIME_MIN
+
+    try:
+        async with session.get(runs_url, headers=headers, timeout=6) as run_resp:
+            if run_resp.status == 200:
+                run_data = await run_resp.json()
+                runs = run_data.get("workflow_runs", [])
+                if runs:
+                    latest_run = runs[0]
+                    run_id = latest_run.get("id")
+                    status = latest_run.get("status", "unknown")
+                    conclusion = latest_run.get("conclusion")
+                    started_at = latest_run.get("run_started_at") or latest_run.get("created_at")
+                    remain_min = calculate_remain_minutes(started_at)
+                else:
+                    created_at = repo.get("created_at", "")
+                    status = "queued" if created_at else "completed"
+    except Exception:
+        return None
+
+    is_active = status in ["in_progress", "queued", "waiting", "requested", "pending"]
+    if not is_active:
+        return {
+            "repo": f"{owner}/{repo_name}",
+            "repo_name": repo_name,
+            "owner": owner,
+            "run_id": run_id,
+            "status": status,
+            "conclusion": conclusion,
+            "remain_min": 0,
+            "ports": [],
+            "slot_count": expected_slots,
+            "is_active": False
+        }
+
+    # Quét song song tất cả các file trong thư mục rdp-ports
+    ports_info = []
+    ports_dir_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/rdp-ports"
+    try:
+        async with session.get(ports_dir_url, headers=headers, timeout=6) as port_resp:
+            if port_resp.status == 200:
+                files = await port_resp.json()
+                if isinstance(files, list):
+                    port_tasks = [
+                        fetch_single_port_file(session, file_obj, headers)
+                        for file_obj in files
+                    ]
+                    port_results = await asyncio.gather(*port_tasks)
+                    ports_info = [p for p in port_results if p is not None]
+                    ports_info.sort(key=lambda x: int(x["slot"]) if str(x["slot"]).isdigit() else 999)
+    except Exception:
+        pass
+
+    actual_slots = max(len(ports_info), expected_slots)
+
+    return {
+        "repo": f"{owner}/{repo_name}",
+        "repo_name": repo_name,
+        "owner": owner,
+        "run_id": run_id,
+        "status": status,
+        "conclusion": conclusion,
+        "remain_min": remain_min,
+        "ports": ports_info,
+        "slot_count": actual_slots,
+        "is_active": True
+    }
+
+
+async def scan_rdp_instances(gh_token: str, discord_user_id: str, include_inactive: bool = False) -> list:
+    """Quét song song tốc độ cao bằng asyncio.gather."""
     if not gh_token:
         return []
     headers = {
         "Authorization": f"Bearer {gh_token}",
         "Accept": "application/vnd.github+json"
     }
-    active_instances = []
     try:
-        async with aiohttp.ClientSession() as session:
-            repos_url = "https://api.github.com/user/repos?per_page=100&sort=updated"
-            async with session.get(repos_url, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    repos = await resp.json()
-                    for repo in repos:
-                        repo_name = repo.get("name", "")
-                        owner = repo.get("owner", {}).get("login", "")
-                        
-                        is_match_convention = repo_name.startswith("ci-worker-") or str(discord_user_id) in repo_name
-                        if not is_match_convention:
-                            continue
+        session = await get_session()
+        repos_url = "https://api.github.com/user/repos?per_page=100&sort=updated"
+        async with session.get(repos_url, headers=headers, timeout=10) as resp:
+            if resp.status != 200:
+                return []
+            repos = await resp.json()
 
-                        runs_url = f"https://api.github.com/repos/{owner}/{repo_name}/actions/runs?per_page=1"
-                        status = "Không hoạt động"
-                        conclusion = "unknown"
-                        
-                        try:
-                            async with session.get(runs_url, headers=headers, timeout=5) as run_resp:
-                                if run_resp.status == 200:
-                                    run_data = await run_resp.json()
-                                    runs = run_data.get("workflow_runs", [])
-                                    if runs:
-                                        status = runs[0].get("status", "unknown")
-                                        conclusion = runs[0].get("conclusion", "unknown")
-                        except Exception:
-                            pass
+        tasks_list = []
+        for repo in repos:
+            repo_name = repo.get("name", "")
+            if repo_name.startswith("ci-worker-") or str(discord_user_id) in repo_name:
+                tasks_list.append(inspect_single_repo(session, repo, headers))
 
-                        ports_info = []
-                        ports_dir_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/rdp-ports"
-                        try:
-                            async with session.get(ports_dir_url, headers=headers, timeout=5) as port_resp:
-                                if port_resp.status == 200:
-                                    files = await port_resp.json()
-                                    if isinstance(files, list):
-                                        for file_obj in files:
-                                            file_url = file_obj.get("download_url")
-                                            if file_url:
-                                                async with session.get(file_url, headers=headers, timeout=5) as f_res:
-                                                    if f_res.status == 200:
-                                                        b64_data = await f_res.text()
-                                                        try:
-                                                            decoded_port = base64.b64decode(b64_data.strip()).decode('utf-8')
-                                                            ports_info.append({
-                                                                "slot": file_obj.get("name").replace(".txt", ""),
-                                                                "address": decoded_port
-                                                            })
-                                                        except Exception:
-                                                            ports_info.append({
-                                                                "slot": file_obj.get("name").replace(".txt", ""),
-                                                                "address": b64_data.strip()
-                                                            })
-                        except Exception:
-                            pass
+        if not tasks_list:
+            return []
 
-                        active_instances.append({
-                            "repo": f"{owner}/{repo_name}",
-                            "status": status,
-                            "conclusion": conclusion,
-                            "ports": ports_info
-                        })
+        results = await asyncio.gather(*tasks_list)
+        valid_results = [r for r in results if r is not None]
+
+        if include_inactive:
+            return valid_results
+        return [r for r in valid_results if r.get("is_active")]
     except Exception as e:
         logger.warning(f"[GitHub API] Lỗi quét RDP instances: {e}")
-    return active_instances
+        return []
+
+
+async def trigger_workflow_on_repo(
+    gh_token: str,
+    repo_full: str,
+    rdp_count: int,
+    user_id: str,
+    data_mode: str,
+    cancel_run_id: int = None
+) -> bool:
+    """
+    Kích hoạt lại (Re-dispatch) workflow ngay trên Repo hiện có để giữ nguyên GitHub Releases (Zero-Touch Data Restore).
+    Nếu có run_id cũ sắp hết hạn, hủy run cũ trước để giải phóng runner & tránh xung đột ghi đè file port.
+    """
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github+json"
+    }
+    session = await get_session()
+    user_config = load_user_config(int(user_id)) if str(user_id).isdigit() else load_user_config(0)
+
+    # Nếu đang gối đầu (run cũ còn sống những phút cuối), hủy run cũ sau khi nó đã backup xong
+    if cancel_run_id:
+        cancel_url = f"https://api.github.com/repos/{repo_full}/actions/runs/{cancel_run_id}/cancel"
+        try:
+            async with session.post(cancel_url, headers=headers, timeout=8) as _:
+                pass
+            await asyncio.sleep(2)
+        except Exception:
+            pass
+
+    # Cập nhật lại description của repo nếu số lượng slot thay đổi
+    patch_url = f"https://api.github.com/repos/{repo_full}"
+    try:
+        await session.patch(
+            patch_url,
+            headers=headers,
+            json={"description": f"Kanda RDP Automated Workspace [SLOTS:{rdp_count}]"},
+            timeout=6
+        )
+    except Exception:
+        pass
+
+    dispatch_url = f"https://api.github.com/repos/{repo_full}/actions/workflows/rdp-bore.yml/dispatches"
+    keywords_str = ",".join(user_config.get("keywords", ["Login", "START"]))
+
+    full_inputs = {
+        "rdp_count": str(rdp_count),
+        "user_id": str(user_id),
+        "data_mode": str(data_mode),
+        "app_path": str(user_config.get("app_path", "")),
+        "keywords": keywords_str,
+        "threads": str(user_config.get("threads", 1)),
+        "license_key": str(user_config.get("license_key", ""))
+    }
+
+    async with session.post(dispatch_url, headers=headers, json={"ref": "main", "inputs": full_inputs}) as resp:
+        if resp.status == 422:
+            basic_inputs = {
+                "rdp_count": str(rdp_count),
+                "user_id": str(user_id),
+                "data_mode": str(data_mode)
+            }
+            async with session.post(dispatch_url, headers=headers, json={"ref": "main", "inputs": basic_inputs}) as retry_resp:
+                return retry_resp.status in [201, 204]
+        return resp.status in [201, 204]
+
 
 async def deploy_rdp_real(gh_token: str, rdp_count: int = 1, user_id: str = "default", data_mode: str = "chung"):
+    """
+    Ưu tiên tái sử dụng Repo cũ đã ngừng chạy (để lấy lại bản backup kanda_state.7z trên GitHub Release).
+    Nếu chưa có Repo nào thì mới tạo Repo mới.
+    """
+    # Kiểm tra xem user đã có sẵn repo ci-worker nào đang nghỉ (inactive) hay chưa
+    all_repos = await scan_rdp_instances(gh_token, str(user_id), include_inactive=True)
+    inactive_repos = [r for r in all_repos if not r.get("is_active")]
+
+    if inactive_repos:
+        reuse_repo = inactive_repos[0]["repo"]
+        logger.info(f"[Zero-Touch] Tái sử dụng repo {reuse_repo} để khôi phục dữ liệu từ Release...")
+        ok = await trigger_workflow_on_repo(
+            gh_token=gh_token,
+            repo_full=reuse_repo,
+            rdp_count=rdp_count,
+            user_id=str(user_id),
+            data_mode=data_mode
+        )
+        if ok:
+            return {"ok": True, "repo_full": reuse_repo, "reused": True}
+
     headers = {
         "Authorization": f"Bearer {gh_token}",
         "Accept": "application/vnd.github+json"
     }
     repo_name = f"ci-worker-{user_id}-{int(time.time())}"
-    
-    async with aiohttp.ClientSession() as session:
-        # Bước 1: Tạo repo (Hỗ trợ gọi cả user endpoint và organization nếu cần)
-        create_url = "https://api.github.com/user/repos"
-        payload = {
-            "name": repo_name,
-            "private": True,
-            "description": "Kanda RDP Automated Workspace"
-        }
-        async with session.post(create_url, headers=headers, json=payload) as resp:
-            if resp.status not in [200, 201]:
-                err_text = await resp.text()
-                logger.error(f"[GitHub] Không thể tạo repo {repo_name}: {resp.status} - {err_text}")
-                return {"ok": False, "error": err_text}
-            repo_data = await resp.json()
-            owner = repo_data.get("owner", {}).get("login", "")
+    session = await get_session()
 
-        await asyncio.sleep(4)
+    # Bước 1: Tạo repo mới nếu chưa có repo nào để tái sử dụng
+    create_url = "https://api.github.com/user/repos"
+    payload = {
+        "name": repo_name,
+        "private": True,
+        "description": f"Kanda RDP Automated Workspace [SLOTS:{rdp_count}]"
+    }
+    async with session.post(create_url, headers=headers, json=payload) as resp:
+        if resp.status not in [200, 201]:
+            err_text = await resp.text()
+            logger.error(f"[GitHub] Không thể tạo repo {repo_name}: {resp.status} - {err_text}")
+            return {"ok": False, "error": err_text}
+        repo_data = await resp.json()
+        owner = repo_data.get("owner", {}).get("login", "")
 
-        try:
-            with open(".github/workflows/rdp-bore.yml", "r", encoding="utf-8") as f:
-                workflow_content = f.read()
-        except Exception:
-            logger.error("Không tìm thấy file template .github/workflows/rdp-bore.yml")
-            return {"ok": False, "error": "Missing template file"}
+    await asyncio.sleep(3)
 
-        wf_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/.github/workflows/rdp-bore.yml"
-        b64_content = base64.b64encode(workflow_content.encode("utf-8")).decode("utf-8")
-        wf_payload = {
-            "message": "Add Kanda RDP Workflow",
-            "content": b64_content
-        }
-        async with session.put(wf_url, headers=headers, json=wf_payload) as resp:
-            if resp.status not in [200, 201]:
-                logger.warning(f"[GitHub] Đẩy file workflow không thành công: {resp.status}")
+    # Bước 2: Đọc và tải lên file workflow
+    try:
+        with open(".github/workflows/rdp-bore.yml", "r", encoding="utf-8") as f:
+            workflow_content = f.read()
+    except Exception:
+        logger.error("Không tìm thấy file template .github/workflows/rdp-bore.yml")
+        return {"ok": False, "error": "Missing template file (.github/workflows/rdp-bore.yml)"}
 
-        await asyncio.sleep(4)
+    wf_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/.github/workflows/rdp-bore.yml"
+    b64_content = base64.b64encode(workflow_content.encode("utf-8")).decode("utf-8")
+    wf_payload = {
+        "message": "Add Kanda RDP Workflow",
+        "content": b64_content
+    }
+    async with session.put(wf_url, headers=headers, json=wf_payload) as resp:
+        if resp.status not in [200, 201]:
+            err_wf = await resp.text()
+            logger.warning(f"[GitHub] Đẩy file workflow không thành công: {resp.status} - {err_wf}")
+            return {"ok": False, "error": f"Upload workflow lỗi: {resp.status}"}
 
-        dispatch_url = f"https://api.github.com/repos/{owner}/{repo_name}/actions/workflows/rdp-bore.yml/dispatches"
-        dispatch_payload = {
-            "ref": "main",
-            "inputs": {
-                "rdp_count": str(rdp_count),
-                "user_id": str(user_id),
-                "data_mode": str(data_mode)
-            }
-        }
-        async with session.post(dispatch_url, headers=headers, json=dispatch_payload) as resp:
-            logger.info(f"[GitHub] Trigger workflow status: {resp.status}")
+    await asyncio.sleep(3)
+
+    # Bước 3: Kích hoạt workflow
+    repo_full = f"{owner}/{repo_name}"
+    await trigger_workflow_on_repo(
+        gh_token=gh_token,
+        repo_full=repo_full,
+        rdp_count=rdp_count,
+        user_id=str(user_id),
+        data_mode=data_mode
+    )
 
     return {
         "ok": True,
-        "repo_full": f"{owner}/{repo_name}"
+        "repo_full": repo_full,
+        "reused": False
     }
 
-# ── Background Task: Auto Loop ──
-@tasks.loop(minutes=2)
+
+async def cleanup_inactive_repos(gh_token: str, discord_user_id: str, keep_latest_one: bool = True) -> int:
+    """
+    Dọn dẹp các repo cũ đã ngừng hoạt động.
+    Mặc định giữ lại 1 repo mới nhất (keep_latest_one=True) để bảo toàn bản sao lưu GitHub Release (kanda_state.7z).
+    """
+    all_instances = await scan_rdp_instances(gh_token, discord_user_id, include_inactive=True)
+    inactive_list = [inst for inst in all_instances if not inst.get("is_active")]
+
+    if keep_latest_one and len(inactive_list) > 0:
+        # Giữ lại repo đầu tiên (mới cập nhật nhất) để không mất Release backup
+        inactive_list = inactive_list[1:]
+
+    if not inactive_list:
+        return 0
+
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github+json"
+    }
+    session = await get_session()
+
+    async def delete_repo(inst):
+        del_url = f"https://api.github.com/repos/{inst['repo']}"
+        try:
+            async with session.delete(del_url, headers=headers, timeout=8) as resp:
+                return resp.status in [204, 200]
+        except Exception:
+            return False
+
+    del_results = await asyncio.gather(*(delete_repo(inst) for inst in inactive_list))
+    return sum(1 for success in del_results if success)
+
+
+# ── Quy Trình Auto Loop Thông Minh (Xoay Vòng Tại Chỗ & Giữ Nguyên Data Release) ──
+async def _process_user_rdp_loop(user_id_str: str, config: dict):
+    """
+    Xử lý 1 chu kỳ kiểm tra Loop của 1 user:
+    1. Nếu có repo đang chạy nhưng thời gian còn lại <= 10 phút -> Re-dispatch ngay trên repo đó.
+    2. Nếu tổng số máy đang chạy < target_rdp_count -> Ưu tiên kích hoạt lại trên repo cũ để khôi phục Release Data.
+    """
+    gh_token = config.get("github_token")
+    data_mode = config.get("data_mode", "chung")
+    target = min(20, max(0, int(config.get("target_rdp_count", 0))))
+    if not gh_token or target <= 0:
+        return
+
+    all_instances = await scan_rdp_instances(gh_token, user_id_str, include_inactive=True)
+    active_instances = [inst for inst in all_instances if inst.get("is_active")]
+    inactive_instances = [inst for inst in all_instances if not inst.get("is_active")]
+
+    # 1. Kiểm tra các repo sắp hết hạn (còn <= 10 phút trước khi Bore đóng ở phút 355)
+    restarted_slots = 0
+    for inst in active_instances:
+        if inst["status"] == "in_progress" and inst.get("remain_min", 355) <= RDP_PREWARM_THRESHOLD_MIN:
+            slots = inst.get("slot_count", 1)
+            logger.info(
+                f"[Auto-Loop] Repo {inst['repo']} của user {user_id_str} chỉ còn {inst['remain_min']} phút. "
+                f"Đang xoay vòng (Re-dispatch) ngay trên repo này để giữ Data..."
+            )
+            ok = await trigger_workflow_on_repo(
+                gh_token=gh_token,
+                repo_full=inst["repo"],
+                rdp_count=slots,
+                user_id=user_id_str,
+                data_mode=data_mode,
+                cancel_run_id=inst.get("run_id")
+            )
+            if ok:
+                restarted_slots += slots
+
+    # 2. Tính tổng số slot đang chạy (bao gồm cả các slot vừa được xoay vòng)
+    current_count = sum(inst.get("slot_count", 1) for inst in active_instances)
+
+    if current_count < target:
+        needed = min(20 - current_count, target - current_count)
+        if needed <= 0:
+            return
+
+        # Ưu tiên bật lại trên repo cũ đã tắt để khôi phục file kanda_state.7z từ GitHub Releases
+        if inactive_instances:
+            reuse_inst = inactive_instances[0]
+            logger.info(
+                f"[Auto-Loop] User {user_id_str} thiếu {needed} máy. "
+                f"Đang kích hoạt lại trên repo cũ {reuse_inst['repo']} (Zero-Touch Data Restore)..."
+            )
+            await trigger_workflow_on_repo(
+                gh_token=gh_token,
+                repo_full=reuse_inst["repo"],
+                rdp_count=needed,
+                user_id=user_id_str,
+                data_mode=data_mode
+            )
+        else:
+            logger.info(f"[Auto-Loop] User {user_id_str} thiếu {needed} máy và chưa có repo cũ. Đang tạo repo mới...")
+            await deploy_rdp_real(
+                gh_token=gh_token,
+                rdp_count=needed,
+                user_id=user_id_str,
+                data_mode=data_mode
+            )
+
+    # Dọn dẹp các repo dư thừa (nhưng luôn giữ lại ít nhất 1 repo để lưu trữ bản backup Release)
+    await cleanup_inactive_repos(gh_token, user_id_str, keep_latest_one=True)
+
+
+@tasks.loop(seconds=60)
 async def auto_loop_task():
+    """Quét mỗi 60 giây/lần kèm khóa _rdp_loop_busy chống chồng chéo."""
     for filename in os.listdir(CONFIG_DIR):
-        if not filename.endswith(".json"): continue
-        user_id = filename.replace(".json", "")
-        config = load_user_config(int(user_id))
-        
-        gh_token = config.get("github_token")
-        if not gh_token or not config.get("loop_enabled"): continue
-        
-        active_instances = await scan_rdp_instances(gh_token, user_id)
-        current_count = len(active_instances)
-        target = config.get("target_rdp_count", 0)
-        
-        if current_count < target:
-            needed = target - current_count
-            if current_count + needed > 20:
-                needed = 20 - current_count
-            if needed > 0:
-                logger.info(f"[Auto-Loop] User {user_id} hụt {needed} máy. Đang dựng lại...")
-                asyncio.create_task(deploy_rdp_real(gh_token, needed, user_id, config.get("data_mode", "chung")))
+        if not filename.endswith(".json"):
+            continue
+        user_id_str = filename.replace(".json", "")
+        if not user_id_str.isdigit() or user_id_str in _rdp_loop_busy:
+            continue
+
+        config = load_user_config(int(user_id_str))
+        if not config.get("github_token") or not config.get("loop_enabled"):
+            continue
+
+        _rdp_loop_busy.add(user_id_str)
+
+        async def _runner(uid=user_id_str, cfg=config):
+            try:
+                await _process_user_rdp_loop(uid, cfg)
+            except Exception as e:
+                logger.warning(f"[Auto-Loop] Lỗi xử lý user {uid}: {e}")
+            finally:
+                _rdp_loop_busy.discard(uid)
+
+        asyncio.create_task(_runner())
+
 
 @auto_loop_task.before_loop
 async def before_auto_loop():
     await bot.wait_until_ready()
 
+
 # ── Modals & Views ──
 class SettingsModal(discord.ui.Modal, title="⚙️ Cài Đặt Cấu Hình"):
-    app_path = discord.ui.TextInput(
-        label="Đường dẫn phần mềm trên RDP",
-        placeholder=r"C:\Users\Thang\Desktop\Tool\tool.exe",
-        default=r"C:\Users\Thang\Desktop\Tool\tool.exe",
-        style=discord.TextStyle.short
-    )
-    keywords = discord.ui.TextInput(
-        label="Từ khóa vượt menu",
-        placeholder="Login, START",
-        default="Login, START",
-        style=discord.TextStyle.short
-    )
-    threads = discord.ui.TextInput(
-        label="Số luồng chạy",
-        placeholder="1",
-        default="1",
-        style=discord.TextStyle.short
-    )
-    license_key = discord.ui.TextInput(
-        label="Key bản quyền (nếu có)",
-        placeholder="Để trống nếu không có",
-        required=False,
-        style=discord.TextStyle.short
-    )
+    def __init__(self, current_config: dict):
+        super().__init__()
+        current_keywords = ", ".join(current_config.get("keywords", ["Login", "START"]))
+
+        self.app_path = discord.ui.TextInput(
+            label="Đường dẫn phần mềm trên RDP",
+            placeholder=r"C:\Users\Thang\Desktop\Tool\tool.exe",
+            default=current_config.get("app_path", r"C:\Users\Thang\Desktop\AutoTool\Tool.exe"),
+            style=discord.TextStyle.short
+        )
+        self.keywords = discord.ui.TextInput(
+            label="Từ khóa vượt menu (cách nhau dấu phẩy)",
+            placeholder="Login, START",
+            default=current_keywords,
+            style=discord.TextStyle.short
+        )
+        self.threads = discord.ui.TextInput(
+            label="Số luồng chạy",
+            placeholder="1",
+            default=str(current_config.get("threads", 1)),
+            style=discord.TextStyle.short
+        )
+        self.license_key = discord.ui.TextInput(
+            label="Key bản quyền (nếu có)",
+            placeholder="Để trống nếu không có",
+            default=current_config.get("license_key", ""),
+            required=False,
+            style=discord.TextStyle.short
+        )
+
+        self.add_item(self.app_path)
+        self.add_item(self.keywords)
+        self.add_item(self.threads)
+        self.add_item(self.license_key)
 
     async def on_submit(self, interaction: discord.Interaction):
         user_id = interaction.user.id
@@ -272,27 +608,35 @@ class SettingsModal(discord.ui.Modal, title="⚙️ Cài Đặt Cấu Hình"):
         config["app_path"] = self.app_path.value.strip()
         config["keywords"] = [k.strip() for k in self.keywords.value.split(",") if k.strip()]
         try:
-            config["threads"] = int(self.threads.value or 1)
+            config["threads"] = max(1, int(self.threads.value.strip() or 1))
         except ValueError:
             config["threads"] = 1
         config["license_key"] = self.license_key.value.strip() if self.license_key.value else ""
         save_user_config(user_id, config)
 
         await interaction.response.send_message(
-            content="✅ **Đã lưu cài đặt cấu hình thành công!**",
+            content=(
+                "✅ **Đã lưu cài đặt cấu hình thành công!**\n"
+                f"• **Đường dẫn:** `{config['app_path']}`\n"
+                f"• **Từ khóa:** `{', '.join(config['keywords'])}`\n"
+                f"• **Số luồng:** `{config['threads']}`"
+            ),
             ephemeral=True
         )
+
 
 class DataModeSelect(discord.ui.Select):
     def __init__(self, count: int):
         self.count = count
         options = [
             discord.SelectOption(label="📁 1. RDP Data Chung", description="Lấy chung dữ liệu & cấu hình từ 1 RDP", value="chung"),
-            discord.SelectOption(label="📂 2. RDP Data Riêng Lẻ", description="Mỗi máy RDP chạy độc lập riêng", value="rieng")
+            discord.SelectOption(label="📂 2. RDP Data Riêng Lẻ", description="Mỗi máy RDP chạy & lưu backup độc lập riêng", value="rieng")
         ]
         super().__init__(placeholder="Chọn chế độ đồng bộ Data...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
         data_mode = self.values[0]
         user_id = interaction.user.id
         config = load_user_config(user_id)
@@ -302,13 +646,17 @@ class DataModeSelect(discord.ui.Select):
 
         gh_token = config.get("github_token")
         active_list = await scan_rdp_instances(gh_token, str(user_id))
-        
-        if len(active_list) + self.count > 20:
-            await interaction.response.edit_message(content=f"❌ **Không thể tạo thêm!** Bạn đang chạy {len(active_list)} máy. Tối đa chỉ 20 máy.", view=None)
+        current_running_slots = sum(inst.get("slot_count", 1) for inst in active_list)
+
+        if current_running_slots + self.count > 20:
+            await interaction.edit_original_response(
+                content=f"❌ **Không thể tạo thêm!** Bạn đang chạy **{current_running_slots}** máy. Tối đa chỉ cho phép 20 máy.",
+                view=None
+            )
             return
 
-        await interaction.response.edit_message(
-            content=f"🖥️ **Đang kết nối GitHub và dựng {self.count} máy RDP thực tế...**",
+        await interaction.edit_original_response(
+            content=f"🖥️ **Đang kết nối GitHub và dựng {self.count} máy RDP (Chế độ: {data_mode.upper()})...**",
             view=None
         )
 
@@ -316,8 +664,13 @@ class DataModeSelect(discord.ui.Select):
             res = await deploy_rdp_real(gh_token, rdp_count=self.count, user_id=str(user_id), data_mode=data_mode)
             if res.get("ok"):
                 repo_full = res.get("repo_full")
+                reused_note = (
+                    "\n♻️ **Đã tái sử dụng Repo cũ:** Tự động khôi phục dữ liệu từ bản sao lưu GitHub Release (`kanda_state.7z`)!"
+                    if res.get("reused") else ""
+                )
                 await interaction.followup.send(
-                    f"🎉 **Khởi tạo thành công {self.count} máy RDP trên repo:** `{repo_full}`!\nThông tin kết nối `mstsc` sẽ tự động cập nhật về lệnh `/rdp` sau 1-2 phút khi runner khởi động xong.",
+                    f"🎉 **Khởi tạo thành công {self.count} máy RDP trên repo:** `{repo_full}`!{reused_note}\n"
+                    f"Thông tin kết nối `mstsc` sẽ tự động cập nhật trong bảng `/rdp` sau 1-2 phút khi runner khởi động xong.",
                     ephemeral=True
                 )
             else:
@@ -329,14 +682,19 @@ class DataModeSelect(discord.ui.Select):
                 ephemeral=True
             )
 
+
 class DataModeView(discord.ui.View):
     def __init__(self, count: int):
         super().__init__(timeout=60)
         self.add_item(DataModeSelect(count))
 
+
 class RDPCountSelect(discord.ui.Select):
     def __init__(self):
-        options = [discord.SelectOption(label=f"{i} máy", description=f"Dựng {i} slot RDP (1-20)", emoji="🟢") for i in range(1, 21)]
+        options = [
+            discord.SelectOption(label=f"{i} máy", description=f"Dựng {i} slot RDP (1-20)", emoji="🟢")
+            for i in range(1, 21)
+        ]
         super().__init__(placeholder="Chọn số lượng máy (1-20)...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
@@ -346,17 +704,19 @@ class RDPCountSelect(discord.ui.Select):
             view=DataModeView(count)
         )
 
+
 class RDPCountView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
         self.add_item(RDPCountSelect())
+
 
 class RDPMenuView(discord.ui.View):
     def __init__(self, user_config: dict):
         super().__init__(timeout=None)
         self.user_config = user_config
 
-    @discord.ui.button(label="Tạo RDP", style=discord.ButtonStyle.success, emoji="🖥️")
+    @discord.ui.button(label="Tạo RDP", style=discord.ButtonStyle.success, emoji="🖥️", row=0)
     async def btn_create(self, interaction: discord.Interaction, btn: discord.ui.Button):
         await interaction.response.send_message(
             content="**Chọn số lượng máy muốn dựng (1-20):**",
@@ -364,24 +724,45 @@ class RDPMenuView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label="Cài đặt", style=discord.ButtonStyle.secondary, emoji="⚙️")
+    @discord.ui.button(label="Cài đặt", style=discord.ButtonStyle.secondary, emoji="⚙️", row=0)
     async def btn_settings(self, interaction: discord.Interaction, btn: discord.ui.Button):
-        await interaction.response.send_modal(SettingsModal())
+        fresh_config = load_user_config(interaction.user.id)
+        await interaction.response.send_modal(SettingsModal(fresh_config))
 
-    @discord.ui.button(label="Làm Mới", style=discord.ButtonStyle.primary, emoji="🔄")
+    @discord.ui.button(label="Làm Mới", style=discord.ButtonStyle.primary, emoji="🔄", row=0)
     async def btn_refresh(self, interaction: discord.Interaction, btn: discord.ui.Button):
         await send_rdp_menu(interaction, is_refresh=True)
 
-    @discord.ui.button(label="Auto Loop: Bật/Tắt", style=discord.ButtonStyle.secondary, emoji="🔁")
+    @discord.ui.button(label="Auto Loop: Bật/Tắt", style=discord.ButtonStyle.secondary, emoji="🔁", row=1)
     async def btn_loop(self, interaction: discord.Interaction, btn: discord.ui.Button):
         uid = interaction.user.id
         conf = load_user_config(uid)
         conf["loop_enabled"] = not conf.get("loop_enabled", False)
         save_user_config(uid, conf)
-        status = "BẬT 🟢" if conf["loop_enabled"] else "TẮT 🔴"
+        status = "BẬT 🟢 (Tự động xoay vòng tại chỗ & khôi phục Data mỗi chu kỳ)" if conf["loop_enabled"] else "TẮT 🔴"
         await interaction.response.send_message(f"Cơ chế Auto Loop đã **{status}**.", ephemeral=True)
 
-    @discord.ui.button(label="Đăng xuất", style=discord.ButtonStyle.danger, emoji="🚪")
+    @discord.ui.button(label="Dọn Repo Dư", style=discord.ButtonStyle.secondary, emoji="🧹", row=1)
+    async def btn_cleanup(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        uid = interaction.user.id
+        conf = load_user_config(uid)
+        gh_token = conf.get("github_token")
+        if not gh_token:
+            await interaction.followup.send("❌ Bạn chưa liên kết GitHub Token!", ephemeral=True)
+            return
+
+        deleted = await cleanup_inactive_repos(gh_token, str(uid), keep_latest_one=True)
+        if deleted > 0:
+            await interaction.followup.send(
+                f"🧹 **Đã dọn dẹp `{deleted}` repository cũ dư thừa!**\n"
+                f"*(Bot vẫn giữ lại 1 repo gốc để bảo toàn bản sao lưu dữ liệu `kanda_state.7z` trên Release)*.",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send("✨ **Tài khoản gọn gàng!** Không có repository rác nào cần dọn dẹp.", ephemeral=True)
+
+    @discord.ui.button(label="Đăng xuất", style=discord.ButtonStyle.danger, emoji="🚪", row=1)
     async def btn_logout(self, interaction: discord.Interaction, btn: discord.ui.Button):
         user_id = interaction.user.id
         config = load_user_config(user_id)
@@ -393,7 +774,8 @@ class RDPMenuView(discord.ui.View):
             ephemeral=True
         )
 
-async def send_rdp_menu(interaction: discord.Interaction, is_refresh=False):
+
+async def send_rdp_menu(interaction: discord.Interaction, is_refresh: bool = False):
     user_id = interaction.user.id
     config = load_user_config(user_id)
     gh_token = config.get("github_token")
@@ -406,43 +788,54 @@ async def send_rdp_menu(interaction: discord.Interaction, is_refresh=False):
             await interaction.response.send_message(msg, ephemeral=True)
         return
 
-    if not is_refresh:
+    if is_refresh:
+        await interaction.response.defer()
+    else:
         await interaction.response.defer(ephemeral=True)
 
-    github_username = await fetch_github_username(gh_token)
-    active_instances = await scan_rdp_instances(gh_token, str(user_id))
+    github_username, active_instances = await asyncio.gather(
+        fetch_github_username(gh_token),
+        scan_rdp_instances(gh_token, str(user_id))
+    )
+
+    total_running_slots = sum(inst.get("slot_count", 1) for inst in active_instances)
 
     instances_text = ""
     if active_instances:
-        instances_text = "\n🟢 **Các máy RDP của bạn đang hoạt động trên GitHub:**\n"
+        instances_text = "\n🟢 **Các cụm máy RDP của bạn đang hoạt động trên GitHub:**\n"
         for inst in active_instances:
-            status_icon = "🔄 Đang chạy" if inst['status'] == 'in_progress' else ("✅ Hoàn tất" if inst['conclusion'] == 'success' else f"📌 {inst['status']}")
-            instances_text += f"• `{inst['repo']}` — {status_icon}\n"
-            if inst.get('ports'):
-                for p in inst['ports']:
+            remain_min = inst.get("remain_min", 355)
+            status_icon = (
+                f"🔄 Đang chạy (Còn ~{remain_min} phút)"
+                if inst["status"] == "in_progress"
+                else f"⏳ Khởi tạo ({inst['status']})"
+            )
+            slot_count = inst.get("slot_count", 1)
+            instances_text += f"• `{inst['repo']}` ({slot_count} máy) — {status_icon}\n"
+            if inst.get("ports"):
+                for p in inst["ports"]:
                     instances_text += f"  └─ 🖥️ **Slot {p['slot']}** | 🌐 `mstsc`: `{p['address']}` | 👤 `Thang` | 🔑 `Thang12345@`\n"
             else:
-                instances_text += f"  └─ ⏳ *Đang khởi tạo cổng kết nối (Chờ 1-2 phút)...*\n"
+                instances_text += "  └─ ⏳ *Đang khôi phục Data & mở cổng Bore (Chờ 1-2 phút)...*\n"
     else:
         instances_text = "\n📂 *Không tìm thấy máy RDP nào đang hoạt động.*"
 
     loop_st = "🟢 BẬT" if config.get("loop_enabled") else "🔴 TẮT"
+    target_cnt = config.get("target_rdp_count", 0)
+    mode_label = "Chung" if config.get("data_mode", "chung") == "chung" else "Riêng từng Slot"
 
     menu_content = (
         "```ansi\n"
-        "\x1b[1;36m🖥️ RDP — Menu Quản Lý\x1b[0m\n"
+        "\x1b[1;36m🖥️ RDP — Menu Quản Lý Zero-Touch 24/7\x1b[0m\n"
         "```\n"
-        f"👤 **Tài khoản GitHub:** `{github_username}`\n"
-        f"🔁 **Auto Loop:** {loop_st} | 📊 **Tổng máy đang chạy:** {len(active_instances)}/20\n"
+        f"👤 **Tài khoản GitHub:** `{github_username}` | 💾 **Chế độ Data:** `{mode_label}`\n"
+        f"🔁 **Auto Loop:** {loop_st} (Mục tiêu: {target_cnt} máy) | 📊 **Tổng máy đang chạy:** `{total_running_slots}/20`\n"
         f"{instances_text}"
     )
 
     view = RDPMenuView(config)
-    
-    if is_refresh:
-        await interaction.edit_original_response(content=menu_content, view=view)
-    else:
-        await interaction.followup.send(content=menu_content, view=view, ephemeral=True)
+    await interaction.edit_original_response(content=menu_content, view=view)
+
 
 class TokenModal(discord.ui.Modal, title="🔒 Set Token"):
     gh_token = discord.ui.TextInput(
@@ -456,6 +849,7 @@ class TokenModal(discord.ui.Modal, title="🔒 Set Token"):
         style=discord.TextStyle.short,
         required=False
     )
+
     async def on_submit(self, interaction: discord.Interaction):
         user_id = interaction.user.id
         config = load_user_config(user_id)
@@ -464,39 +858,47 @@ class TokenModal(discord.ui.Modal, title="🔒 Set Token"):
         save_user_config(user_id, config)
         await interaction.response.send_message("✅ **Lưu Token thành công!** Hãy dùng lệnh `/rdp`.", ephemeral=True)
 
+
 class STKView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+
     @discord.ui.button(label="Nhập Token", style=discord.ButtonStyle.primary, emoji="✏️")
     async def enter_token(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(TokenModal())
 
+
 @bot.event
 async def on_ready():
-    try:
-        synced = await bot.tree.sync()
-        print(f"[+] Đã đồng bộ {len(synced)} slash commands thành công!")
-    except Exception as e:
-        print(f"[!] Lỗi đồng bộ command: {e}")
-    
     if not auto_loop_task.is_running():
         auto_loop_task.start()
-    print(f"[+] Bot đã sẵn sàng: {bot.user}")
+    logger.info(f"[+] Bot đã sẵn sàng: {bot.user}")
+
 
 @bot.tree.command(name="rdp", description="Mở bảng điều khiển quản lý RDP 24/7")
 async def rdp_menu_command(interaction: discord.Interaction):
     await send_rdp_menu(interaction)
 
+
 @bot.tree.command(name="stk", description="Cung cấp Token GitHub bảo mật tuyệt đối")
 async def stk_command(interaction: discord.Interaction):
     embed = discord.Embed(title="🔐 Bạn đã có token chưa?", color=0x2b2d31)
-    embed.add_field(name="🐙 GitHub Token:", value="[Lấy token GitHub](https://github.com/settings/tokens)\n*(Cần bật quyền: repo, delete_repo, workflow)*", inline=False)
-    embed.add_field(name="🚂 Railway Token:", value="[Lấy token Railway](https://railway.app/account/tokens)", inline=False)
+    embed.add_field(
+        name="🐙 GitHub Token:",
+        value="[Lấy token GitHub](https://github.com/settings/tokens)\n*(Cần bật quyền: repo, delete_repo, workflow)*",
+        inline=False
+    )
+    embed.add_field(
+        name="🚂 Railway Token:",
+        value="[Lấy token Railway](https://railway.app/account/tokens)",
+        inline=False
+    )
     embed.set_footer(text="Nhấn nút bên dưới để nhập an toàn.")
     await interaction.response.send_message(embed=embed, view=STKView(), ephemeral=True)
 
+
 if __name__ == "__main__":
     if not TOKEN:
-        print("[!] Cảnh báo: Biến môi trường DISCORD_BOT_TOKEN chưa được thiết lập trên Railway!")
+        logger.warning("[!] Cảnh báo: Biến môi trường DISCORD_BOT_TOKEN chưa được thiết lập!")
     else:
         bot.run(TOKEN)
