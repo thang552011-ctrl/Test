@@ -562,7 +562,7 @@ async def _process_user_rdp_loop(user_id_str: str, config: dict):
             await deploy_rdp_real(
                 gh_token=gh_token,
                 rdp_count=needed,
-                user_id=str(user_id),
+                user_id=user_id_str,
                 data_mode=data_mode
             )
 
@@ -676,7 +676,7 @@ class DataModeSelect(discord.ui.Select):
         config = load_user_config(user_id)
         config["data_mode"] = data_mode
         config["target_rdp_count"] = self.count
-        config["loop_enabled"] = True  # Tự động bật loop khi tạo máy
+        config["loop_enabled"] = True
         save_user_config(user_id, config)
 
         gh_token = config.get("github_token")
@@ -775,6 +775,10 @@ class RDPMenuView(discord.ui.View):
         recreate_count = min(20, max(1, int(recreate_count)))
         data_mode = conf.get("data_mode", "chung")
 
+        conf["target_rdp_count"] = recreate_count
+        conf["loop_enabled"] = True
+        save_user_config(uid, conf)
+
         await interaction.followup.send(
             f"♻️ **Đang xóa toàn bộ RDP cũ và tái tạo mới `{recreate_count}` máy RDP (Chế độ: `{data_mode.upper()}`)...**",
             ephemeral=True
@@ -791,9 +795,6 @@ class RDPMenuView(discord.ui.View):
             force_new_repo=True
         )
         if res.get("ok"):
-            conf["target_rdp_count"] = recreate_count
-            conf["loop_enabled"] = True  # Đảm bảo bật loop sau khi tái tạo
-            save_user_config(uid, conf)
             await interaction.followup.send(
                 f"✅ **Tái tạo RDP hoàn tất!**\n"
                 f"• Đã xóa sạch `{deleted_count}` repository cũ.\n"
